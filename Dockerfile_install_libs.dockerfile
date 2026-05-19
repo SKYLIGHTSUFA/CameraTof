@@ -1,0 +1,15 @@
+FROM gige-hls:galaxysdk-v2
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+ENV GALAXY_SDK=/opt/galaxy_sdk
+ENV GENICAM_GENTL64_PATH=/opt/galaxy_sdk/lib/x86_64
+ENV LD_LIBRARY_PATH=/opt/galaxy_sdk/lib/x86_64:/opt/python3/lib:/usr/local/lib:/usr/local/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+COPY whl /app/whl
+RUN pip install --no-index --find-links /app/whl pyzmq
+
+WORKDIR /app
+
+CMD ["python3", "-u", "app.py"]

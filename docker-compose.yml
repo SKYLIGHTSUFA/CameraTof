@@ -1,6 +1,9 @@
 services:
-  gige-hls-galaxysdk:
-    image: gige-hls:galaxysdk-v2
+  gige-hls-galaxysdk-v3:
+    build:
+      context: .
+      dockerfile: Dockerfile_install_libs
+    image: gige-hls:galaxysdk-v3
     #image: redos8-python311-cuda:cupy-py-spy
     container_name: gige-hls-galaxysdk
     volumes:
