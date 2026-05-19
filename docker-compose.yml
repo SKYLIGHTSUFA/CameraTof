@@ -1,0 +1,38 @@
+services:
+  gige-hls-galaxysdk:
+    image: gige-hls:galaxysdk-v2
+    #image: redos8-python311-cuda:cupy-py-spy
+    container_name: gige-hls-galaxysdk
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./config.json:/app/config.json:ro
+      - /mnt/test_ramdisk:/app/hls_output:rw
+      - ./Galaxy_Linux-x86_Gige-U3_32bits-64bits_2.4.2507.9231/Galaxy_camera/config/log4cplus.properties:/etc/Galaxy/cfg/log4cplus.properties
+      #- ./report:/app/report
+      #- ./profile.sh:/app/profile.sh:ro
+      # - type: tmpfs
+      #   target: /app/hls_output
+      #   tmpfs:
+      #     size: 2147483648 # 2GB
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    #user: "root"
+    #command: ["sh", "-c", "sleep infinity"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONFAULTHANDLER=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # device_ids: ['0']
+              count: all # comment this line
+              capabilities: [gpu, video, compute, utility]
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    shm_size: '2gb'

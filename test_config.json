@@ -1,0 +1,22 @@
+{
+  "base_output_dir": "hls_output",
+  "width": 480,
+  "height": 240,
+  "cam_width": 1920,
+  "cam_height": 1200,
+  "fps_target": 10,
+  "pixel_format": "BayerRG8",
+  "exposure_time_us": 20000, 
+  "update_params": true,
+  "max_retries": 3,
+  "retry_delay": 2,
+  "gpu_device_ids": null,
+  "use_nvenc": true,
+  "hls_segment_sec": 1,
+  "hls_list_size": 6,
+  "aravis_buffer_count": 32,
+  "aravis_pop_timeout_us": 1500000,
+  "camera_mapping": {
+    "192.168.1.67": "new"
+  }
+}

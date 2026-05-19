@@ -1,0 +1,21 @@
+services:
+  gige-hls-galaxysdk:
+    image: gige-hls:galaxysdk-v3
+    container_name: gige-hls-galaxysdk
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./test.json:/app/config.json:ro
+      - ./hls_output:/app/hls_output:rw
+      # - type: tmpfs
+      #   target: /app/hls_output
+      #   tmpfs:
+      #     size: 2147483648 # 2GB
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    shm_size: '2gb'
