@@ -187,6 +187,8 @@ docker network create apps
 
 ## Быстрая шпаргалка
 
+**Тест видеостены без камер (Linux):** см. [video_new/nof-front-camera/README.md](video_new/nof-front-camera/README.md)
+
 **Онлайн (подготовка):**
 ```bash
 docker compose build
