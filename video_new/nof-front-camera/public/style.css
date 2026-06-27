@@ -10,6 +10,7 @@
     --warn:      #e0a83b;  /* офлайн */
     --danger:    #e5484d;
     --topbar-h:  52px;
+    --statusbar-h: 28px;
 }
 
 * { box-sizing: border-box; }
@@ -17,7 +18,12 @@
 html, body {
     margin: 0;
     height: 100%;
-    background: var(--bg);
+    background-color: var(--bg);
+    background-image:
+        radial-gradient(ellipse 120% 70% at 50% -15%, rgba(54, 211, 153, 0.07), transparent 55%),
+        linear-gradient(rgba(42, 51, 64, 0.18) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(42, 51, 64, 0.18) 1px, transparent 1px);
+    background-size: 100% 100%, 28px 28px, 28px 28px;
     color: var(--text);
     font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
     -webkit-font-smoothing: antialiased;
@@ -34,8 +40,59 @@ body { display: flex; flex-direction: column; overflow: hidden; }
     align-items: center;
     gap: 12px;
     padding: 0 12px;
-    background: var(--panel);
+    background: rgba(22, 27, 34, 0.92);
     border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(8px);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    padding-right: 8px;
+    border-right: 1px solid var(--line);
+    margin-right: 4px;
+    min-width: 0;
+}
+
+.brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    color: #06281d;
+    background: linear-gradient(135deg, var(--accent), #2bb88a);
+    box-shadow: 0 0 16px rgba(54, 211, 153, 0.25);
+}
+
+.brand-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.brand-title {
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.brand-sub {
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
 }
 
 .tabs {
@@ -45,6 +102,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
     gap: 6px;
     overflow-x: auto;
     scrollbar-width: thin;
+    min-width: 0;
 }
 .tabs::-webkit-scrollbar { height: 6px; }
 .tabs::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
@@ -80,6 +138,32 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 }
 .tab.active .tab-name { color: var(--accent); }
 
+.tab-badge {
+    font-family: "JetBrains Mono", ui-monospace, "Consolas", monospace;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    margin-right: 8px;
+    border-radius: 999px;
+    background: rgba(139, 151, 167, 0.15);
+    color: var(--muted);
+    border: 1px solid var(--line);
+}
+.tab.active .tab-badge {
+    border-color: rgba(54, 211, 153, 0.35);
+    color: var(--accent);
+    background: rgba(54, 211, 153, 0.1);
+}
+.tab-badge.all-online {
+    color: var(--accent);
+    border-color: rgba(54, 211, 153, 0.4);
+    background: rgba(54, 211, 153, 0.12);
+}
+.tab-badge.none-online {
+    color: var(--warn);
+    border-color: rgba(224, 168, 59, 0.35);
+}
+
 .tab-del {
     background: none;
     border: none;
@@ -109,7 +193,29 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 
 /* ---------- Сцена с камерами ---------- */
 
-.stage { flex: 1; min-height: 0; padding: 10px; }
+.stage {
+    flex: 1;
+    min-height: 0;
+    padding: 10px;
+    position: relative;
+}
+
+.statusbar {
+    flex: 0 0 var(--statusbar-h);
+    height: var(--statusbar-h);
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(22, 27, 34, 0.92);
+    border-top: 1px solid var(--line);
+    backdrop-filter: blur(8px);
+    letter-spacing: 0.02em;
+}
+
+#statusText strong,
+.statusbar .online-count { color: var(--accent); font-weight: 600; }
 
 .camera-grid {
     display: grid;
@@ -128,6 +234,41 @@ body { display: flex; flex-direction: column; overflow: hidden; }
     border-radius: 10px;
     overflow: hidden;
     min-height: 0;
+    transition: border-color .2s, box-shadow .2s, opacity .2s;
+}
+
+.camera-cell.is-online {
+    border-color: rgba(54, 211, 153, 0.42);
+    box-shadow:
+        0 0 0 1px rgba(54, 211, 153, 0.1),
+        0 4px 18px rgba(0, 0, 0, 0.22);
+    cursor: pointer;
+}
+
+.camera-cell.is-online:hover {
+    border-color: rgba(54, 211, 153, 0.75);
+    box-shadow:
+        0 0 0 1px rgba(54, 211, 153, 0.2),
+        0 6px 24px rgba(0, 0, 0, 0.28);
+}
+
+.camera-cell.is-offline {
+    opacity: 0.68;
+    border-color: rgba(42, 51, 64, 0.9);
+}
+
+.camera-cell:fullscreen {
+    border-radius: 0;
+    border-color: var(--accent-dk);
+    background: #000;
+}
+
+.camera-cell:fullscreen .camera-header {
+    background: rgba(0, 0, 0, 0.85);
+}
+
+.camera-cell:fullscreen .fs-hint {
+    opacity: 1;
 }
 
 .camera-header {
@@ -151,8 +292,31 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 }
 
 .camera-status { font-size: 10px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
-.camera-status.online  { color: var(--accent); }
+.camera-status.online  { color: var(--accent); text-shadow: 0 0 8px rgba(54, 211, 153, 0.35); }
 .camera-status.offline { color: var(--muted); }
+
+.fs-hint {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    background: rgba(0, 0, 0, 0.55);
+    color: var(--text);
+    font-size: 14px;
+    opacity: 0;
+    transition: opacity .2s;
+    pointer-events: none;
+}
+
+.camera-cell.is-online:hover .fs-hint,
+.camera-cell:fullscreen .fs-hint {
+    opacity: 1;
+}
 
 .video-container {
     flex: 1;
@@ -309,7 +473,13 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 
 .muted { color: var(--muted); font-size: 13px; padding: 14px; text-align: center; }
 
+@media (max-width: 900px) {
+    .brand-sub { display: none; }
+    .brand { padding-right: 6px; margin-right: 2px; }
+}
+
 @media (max-width: 600px) {
     .tab-name { max-width: 120px; }
     .btn-add { padding: 9px 12px; }
+    .brand-text { display: none; }
 }

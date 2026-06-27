@@ -3,12 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вывод камер</title>
+    <title>Видеостена</title>
     <link rel="stylesheet" href="/style.css">
     <script src="/hls.js"></script>
 </head>
 <body>
     <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">VW</div>
+            <div class="brand-text">
+                <span class="brand-title">Видеостена</span>
+                <span class="brand-sub" id="brandSub">Мониторинг камер</span>
+            </div>
+        </div>
         <div class="tabs" id="tabs"></div>
         <button class="btn-add" id="btnAdd" type="button">+ Добавить</button>
     </header>
@@ -18,6 +25,10 @@
             <div class="loading"><div class="spinner"></div></div>
         </div>
     </main>
+
+    <footer class="statusbar" id="statusBar">
+        <span id="statusText">Загрузка…</span>
+    </footer>
 
     <!-- Окно создания конфигурации -->
     <div class="modal-overlay" id="modal" hidden>
@@ -78,7 +89,45 @@
             }
         }
 
-        // ---------- Вкладки ----------
+        // ---------- Статистика и вкладки ----------
+
+        function getTabStats(id) {
+            let list;
+            if (id === 'all') {
+                list = allCameras;
+            } else {
+                const cfg = configs.find(c => c.id === id);
+                if (!cfg) return { online: 0, total: 0 };
+                const byId = new Map(allCameras.map(c => [c.id, c]));
+                list = cfg.cameras.map(camId => byId.get(camId) || { hasStream: false });
+            }
+            const total = list.length;
+            const online = list.filter(c => c.hasStream).length;
+            return { online, total };
+        }
+
+        function updateStatusBar() {
+            const total = allCameras.length;
+            const online = allCameras.filter(c => c.hasStream).length;
+            const offline = total - online;
+            const timeStr = new Date().toLocaleTimeString('ru-RU', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            $('statusText').textContent =
+                `${total} камер · ${online} online · ${offline} offline · обновлено ${timeStr}`;
+        }
+
+        function updateBrandSub() {
+            const cfg = configs.find(c => c.id === activeId);
+            const stats = getTabStats(activeId);
+            if (activeId === 'all') {
+                $('brandSub').textContent = `Все камеры · ${stats.online}/${stats.total} online`;
+            } else if (cfg) {
+                $('brandSub').textContent = `${cfg.name} · ${stats.online}/${stats.total} online`;
+            }
+        }
 
         function renderTabs() {
             const tabs = $('tabs');
@@ -91,6 +140,7 @@
             const atLimit = savedCount >= MAX_CONFIGS;
             $('btnAdd').disabled = atLimit;
             $('btnAdd').title = atLimit ? `Достигнут лимит в ${MAX_CONFIGS} конфигураций` : '';
+            updateBrandSub();
         }
 
         function makeTab(id, label, deletable) {
@@ -103,6 +153,18 @@
             name.textContent = label;
             name.addEventListener('click', () => setActive(id));
             tab.appendChild(name);
+
+            const stats = getTabStats(id);
+            const badge = document.createElement('span');
+            badge.className = 'tab-badge';
+            if (stats.total > 0 && stats.online === stats.total) {
+                badge.classList.add('all-online');
+            } else if (stats.online === 0 && stats.total > 0) {
+                badge.classList.add('none-online');
+            }
+            badge.textContent = `${stats.online}/${stats.total}`;
+            badge.title = `${stats.online} online из ${stats.total}`;
+            tab.appendChild(badge);
 
             if (deletable) {
                 const del = document.createElement('button');
@@ -120,6 +182,7 @@
             activeId = id;
             renderTabs();
             render(true);
+            updateBrandSub();
         }
 
         // ---------- Какие камеры показывать ----------
@@ -153,10 +216,16 @@
             const sig = signatureOf(list);
             // Если набор камер не изменился — не пересобираем сетку,
             // чтобы видео не перезапускалось каждые 10 секунд.
-            if (!force && sig === lastSignature) return;
+            if (!force && sig === lastSignature) {
+                updateStatusBar();
+                updateBrandSub();
+                return;
+            }
             lastSignature = sig;
             renderCameraGrid(list);
             optimizeGridLayout(list.length);
+            updateStatusBar();
+            updateBrandSub();
         }
 
         function destroyPlayers() {
@@ -179,7 +248,7 @@
                 const key = `${index}-${camera.id}`;
 
                 const cell = document.createElement('div');
-                cell.className = 'camera-cell';
+                cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
 
                 const header = document.createElement('div');
                 header.className = 'camera-header';
@@ -190,7 +259,7 @@
 
                 const status = document.createElement('span');
                 status.className = 'camera-status ' + (camera.hasStream ? 'online' : 'offline');
-                status.textContent = camera.hasStream ? '● ONLINE' : '○ OFFLINE';
+                status.textContent = camera.hasStream ? '● LIVE' : '○ OFF';
 
                 header.appendChild(cName);
                 header.appendChild(status);
@@ -205,6 +274,16 @@
                     video.playsInline = true;
                     video.autoplay = true;
                     videoBox.appendChild(video);
+
+                    const fsHint = document.createElement('span');
+                    fsHint.className = 'fs-hint';
+                    fsHint.textContent = '⛶';
+                    fsHint.title = 'Полный экран';
+                    videoBox.appendChild(fsHint);
+
+                    cell.title = 'Клик — полноэкранный режим';
+                    cell.addEventListener('click', () => toggleFullscreen(cell));
+
                     setTimeout(() => initHLSPlayer(video, camera.streamUrl, key), 50);
                 } else {
                     const ph = document.createElement('div');
@@ -224,7 +303,7 @@
             if (count === 0) { grid.style.gridTemplateColumns = '1fr'; return; }
 
             const vw = grid.clientWidth || window.innerWidth;
-            const vh = grid.clientHeight || (window.innerHeight - 52);
+            const vh = grid.clientHeight || (window.innerHeight - 52 - 28);
             const aspect = 16 / 9;
             const gap = 8;
 
@@ -245,6 +324,15 @@
                 }
             }
             grid.style.gridTemplateColumns = `repeat(${bestCols}, 1fr)`;
+        }
+
+        function toggleFullscreen(cell) {
+            if (!cell.classList.contains('is-online')) return;
+            if (document.fullscreenElement === cell) {
+                document.exitFullscreen().catch(() => {});
+            } else {
+                cell.requestFullscreen().catch(() => {});
+            }
         }
 
         function initHLSPlayer(videoElement, streamUrl, key) {
@@ -408,7 +496,12 @@
             $('btnCancel').addEventListener('click', closeModal);
             $('btnSave').addEventListener('click', saveConfig);
             $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
-            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    if (!$('modal').hidden) closeModal();
+                    else if (document.fullscreenElement) document.exitFullscreen();
+                }
+            });
             $('configName').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveConfig(); });
         }
 
