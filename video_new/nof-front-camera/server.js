@@ -15,12 +15,21 @@ const PORT = Number(process.env.PORT || 4000);
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const HLS_OUTPUT_DIR = process.env.HLS_OUTPUT_DIR || path.resolve(__dirname, '../../hls_output');
-const CONFIG_FILE = process.env.CONFIG_FILE || path.resolve(__dirname, '../../config.json');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+const HLS_OUTPUT_DIR = path.resolve(
+    process.env.HLS_OUTPUT_DIR || path.join(__dirname, '../../hls_output')
+);
+const CONFIG_FILE = path.resolve(
+    process.env.CONFIG_FILE || path.join(__dirname, '../../config.json')
+);
 const CAMERA_FOLDER_PREFIX = process.env.CAMERA_FOLDER_PREFIX || 'camera_';
 const CONFIGS_FILE = path.join(DATA_DIR, 'configs.json');
 const MAX_CONFIGS = 7;
+
+function isInside(parent, child) {
+    const relative = path.relative(parent, child);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
 
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
@@ -232,10 +241,9 @@ app.delete('/api/configs/:id', (req, res) => {
 
 app.get('/hls/:camera/:file', (req, res) => {
     const { camera, file } = req.params;
-    const filePath = path.join(HLS_OUTPUT_DIR, camera, file);
+    const filePath = path.resolve(HLS_OUTPUT_DIR, camera, file);
 
-    const normalizedPath = path.normalize(filePath);
-    if (!normalizedPath.startsWith(HLS_OUTPUT_DIR)) {
+    if (!isInside(HLS_OUTPUT_DIR, filePath)) {
         return res.status(403).send('Forbidden');
     }
 
