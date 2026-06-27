@@ -81,11 +81,20 @@ ls hls_output/camera_*/index.m3u8
 ```bash
 cd video_new/nof-front-camera
 npm install
+npm start
+```
 
+По умолчанию сервер использует:
+- `../../hls_output` — папка с HLS
+- `../../config.json` — список камер
+- `./data` — сохранённые раскладки
+
+При необходимости можно переопределить:
+
+```bash
 export HLS_OUTPUT_DIR=../../hls_output
 export CONFIG_FILE=../../config.json
 export PORT=4000
-
 npm start
 ```
 

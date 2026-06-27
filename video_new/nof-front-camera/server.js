@@ -13,12 +13,12 @@ try {
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 
-const HLS_OUTPUT_DIR = process.env.HLS_OUTPUT_DIR || '/hls_output';
-const CONFIG_FILE = process.env.CONFIG_FILE || '';
-const CAMERA_FOLDER_PREFIX = process.env.CAMERA_FOLDER_PREFIX || 'camera_';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const DATA_DIR = process.env.DATA_DIR || '/app/data';
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const HLS_OUTPUT_DIR = process.env.HLS_OUTPUT_DIR || path.resolve(__dirname, '../../hls_output');
+const CONFIG_FILE = process.env.CONFIG_FILE || path.resolve(__dirname, '../../config.json');
+const CAMERA_FOLDER_PREFIX = process.env.CAMERA_FOLDER_PREFIX || 'camera_';
 const CONFIGS_FILE = path.join(DATA_DIR, 'configs.json');
 const MAX_CONFIGS = 7;
 
