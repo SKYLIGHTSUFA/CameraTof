@@ -1,0 +1,28 @@
+services:
+  gige-hls-front:
+    build: .
+    platform: linux/amd64
+    container_name: gige-hls-front
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      # Та же папка, куда backend пишет HLS (в docker-compose backend: /mnt/test_ramdisk)
+      - /mnt/test_ramdisk:/hls_output:ro
+      # Список камер и секций из backend config.json
+      - ../../config.json:/app/config.json:ro
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - HLS_OUTPUT_DIR=/hls_output
+      - CONFIG_FILE=/app/config.json
+      - CAMERA_FOLDER_PREFIX=camera_
+      - CHOKIDAR_USEPOLLING=true
+    networks:
+      - apps
+
+networks:
+  apps:
+    name: apps
+    external: true

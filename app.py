@@ -67,7 +67,10 @@ PIXEL_FORMAT_TARGET = config.get("pixel_format", "BayerGB8")
 EXPOSURE_TIME_US = config.get("exposure_time_us", 10000.0)
 UPDATE_PARAMS = config.get("update_params", False)
 
-FPS_TARGET = config.get("fps_target", 20)
+FPS_TARGET = float(config.get("fps_target", 20))
+MAX_CAMERA_FPS = float(config.get("max_camera_fps", 10))
+EFFECTIVE_FPS_TARGET = min(FPS_TARGET, MAX_CAMERA_FPS)
+SOFTWARE_FPS_LIMIT = config.get("software_fps_limit", False)
 MAX_RETRIES = config.get("max_retries", 3)
 RETRY_DELAY = config.get("retry_delay", 2)
 
@@ -169,6 +172,18 @@ def safe_set_node(nodemap, name: str, value) -> bool:
     return False
 
 
+def safe_get_node(nodemap, name: str, default="Unknown"):
+    """Read a GenICam node value by name without breaking camera startup."""
+    try:
+        if hasattr(nodemap, name):
+            node = getattr(nodemap, name)
+            if hasattr(node, 'value'):
+                return node.value
+    except Exception:
+        pass
+    return default
+
+
 def try_set_camera_params(device, camera_name: str) -> bool:
     try:
         nm = device.remote_device.node_map
@@ -180,9 +195,18 @@ def try_set_camera_params(device, camera_name: str) -> bool:
             safe_set_node(nm, "TriggerMode", "Off")
             safe_set_node(nm, "ExposureAuto", "Off")
             safe_set_node(nm, "GainAuto", "Off")
-            safe_set_node(nm, "AcquisitionFrameRateMode", "On")
-            #safe_set_node(nm, "AcquisitionFrameRate", FPS_TARGET)
-            safe_set_node(nm, "AcquisitionFrameRate", 5)           
+            fps_mode_ok = safe_set_node(nm, "AcquisitionFrameRateMode", "On")
+            fps_enable_ok = safe_set_node(nm, "AcquisitionFrameRateEnable", True)
+            fps_ok = safe_set_node(nm, "AcquisitionFrameRate", EFFECTIVE_FPS_TARGET)
+            real_fps = safe_get_node(nm, "AcquisitionFrameRate")
+            fps_mode = safe_get_node(nm, "AcquisitionFrameRateMode")
+            fps_enable = safe_get_node(nm, "AcquisitionFrameRateEnable")
+            print(
+                f"[CAM {camera_name}] AcquisitionFrameRate target={EFFECTIVE_FPS_TARGET} "
+                f"(config={FPS_TARGET}, max={MAX_CAMERA_FPS}), "
+                f"actual={real_fps}, mode={fps_mode}, enable={fps_enable}, "
+                f"set_ok={fps_ok}, mode_ok={fps_mode_ok}, enable_ok={fps_enable_ok}"
+            )
 
             # ROI
             try:
@@ -224,7 +248,6 @@ def try_set_camera_params(device, camera_name: str) -> bool:
                 print(f"[CAM {camera_name}] не удалось установить Gain: {e}")
 
             safe_set_node(nm, "GevSCPSPacketSize", 8000)
-            #safe_set_node(nm, "AcquisitionFrameRateEnable", False)
         else:
             print(f"[CAM {camera_name}] ⏩ Обновление параметров пропущено (update_params=false)")
 
@@ -316,7 +339,7 @@ class HLSStreamer:
         self.src_h = CAM_HEIGHT
 
     def _build_cmd(self):
-        gop = FPS_TARGET * HLS_SEGMENT_SEC
+        gop = max(1, round(EFFECTIVE_FPS_TARGET * HLS_SEGMENT_SEC))
 
         if self.use_nvenc:
             # Если на входе уже yuv420p (сделан GPU-дебайер в Python) — сразу грузим на GPU и масштабируем.
@@ -362,7 +385,7 @@ class HLSStreamer:
             "-f", "rawvideo",
             "-pix_fmt", self.src_pix_fmt,
             "-s", f"{self.src_w}x{self.src_h}",
-            "-r", str(FPS_TARGET),
+            "-r", str(EFFECTIVE_FPS_TARGET),
             "-i", "-",
             *encode_args,
             "-f", "hls",
@@ -510,7 +533,7 @@ class CameraWorker:
         self._drop_count = 0
         self._last_drop_log = time.time()
 
-        self.frame_interval = 1.0 / FPS_TARGET
+        self.frame_interval = 1.0 / EFFECTIVE_FPS_TARGET if EFFECTIVE_FPS_TARGET > 0 else 0.0
         self.last_frame_time = 0.0
 
         self.pixel_format = "Unknown"
@@ -613,7 +636,11 @@ class CameraWorker:
                         continue
 
                     now = time.time()
-                    if now - self.last_frame_time <= self.frame_interval:
+                    if (
+                        SOFTWARE_FPS_LIMIT
+                        and self.frame_interval > 0
+                        and now - self.last_frame_time < self.frame_interval
+                    ):
                         self.fetch_count += 1
                         continue
 

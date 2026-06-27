@@ -1,2 +1,5 @@
 /whl
 /Galaxy_Linux-x86_Gige-U3_32bits-64bits_2.4.2507.9231
+
+# Локальные Docker-образы (docker save / docker load)
+*.tar

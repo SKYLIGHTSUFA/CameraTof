@@ -1,0 +1,13 @@
+{
+  "name": "gige-hls-front",
+  "version": "1.0.0",
+  "description": "HLS camera viewer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "chokidar": "^3.5.3"
+  }
+}
