@@ -1,6 +1,7 @@
 services:
   gige-hls-front:
     build: .
+    image: gige-hls-front:latest
     platform: linux/amd64
     container_name: gige-hls-front
     restart: unless-stopped

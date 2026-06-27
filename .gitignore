@@ -3,3 +3,4 @@
 
 # Локальные Docker-образы (docker save / docker load)
 *.tar
+offline/images/
