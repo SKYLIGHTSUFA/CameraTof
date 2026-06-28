@@ -60,12 +60,22 @@
 
         let allCameras = [];      // все камеры (папки в streams)
         let configs = [];         // сохранённые конфигурации
-        let activeId = 'all';     // 'all' или id конфигурации
-        let players = {};         // активные HLS-плееры
-        let lastSignature = '';   // подпись текущей сетки (чтобы не дёргать видео)
+        let activeId = null;      // id активной вкладки (секция / конфиг)
+        let players = {};         // HLS-плееры только активной вкладки
+        let lastSignature = '';
         let refreshTimer = null;
 
         const $ = (id) => document.getElementById(id);
+
+        /** Видео грузим только на вкладке секции/конфига, не на «Все камеры». */
+        function isVideoTab(id) {
+            return id && id !== 'all';
+        }
+
+        function defaultActiveId() {
+            const firstSection = configs.find(c => c.builtin && c.id.startsWith('section:'));
+            return firstSection ? firstSection.id : (configs[0]?.id || 'all');
+        }
 
         // ---------- Загрузка данных ----------
 
@@ -107,6 +117,9 @@
         }
 
         function updateStatusBar() {
+            const viewList = camerasForActive();
+            const viewOnline = viewList.filter(c => c.hasStream).length;
+            const viewTotal = viewList.length;
             const total = allCameras.length;
             const online = allCameras.filter(c => c.hasStream).length;
             const offline = total - online;
@@ -115,8 +128,11 @@
                 minute: '2-digit',
                 second: '2-digit'
             });
+            const viewLabel = isVideoTab(activeId)
+                ? ` · на экране ${viewOnline}/${viewTotal}`
+                : '';
             $('statusText').textContent =
-                `${total} камер · ${online} online · ${offline} offline · обновлено ${timeStr}`;
+                `${total} камер · ${online} online · ${offline} offline${viewLabel} · обновлено ${timeStr}`;
         }
 
         function updateBrandSub() {
@@ -179,10 +195,12 @@
         }
 
         function setActive(id) {
+            if (activeId === id) return;
+            destroyPlayers();
+            lastSignature = '';
             activeId = id;
             renderTabs();
             render(true);
-            updateBrandSub();
         }
 
         // ---------- Какие камеры показывать ----------
@@ -242,13 +260,22 @@
                 return;
             }
 
+            const playVideo = isVideoTab(activeId);
             container.innerHTML = '';
 
+            if (!playVideo) {
+                const hint = document.createElement('div');
+                hint.className = 'all-tab-hint';
+                hint.textContent = 'Обзор без видео — выберите секцию для просмотра потоков';
+                container.appendChild(hint);
+            }
+
             cameras.forEach((camera, index) => {
-                const key = `${index}-${camera.id}`;
+                const key = `${activeId}-${camera.id}`;
 
                 const cell = document.createElement('div');
                 cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
+                if (!playVideo) cell.classList.add('no-video');
 
                 const header = document.createElement('div');
                 header.className = 'camera-header';
@@ -267,7 +294,7 @@
                 const videoBox = document.createElement('div');
                 videoBox.className = 'video-container';
 
-                if (camera.hasStream) {
+                if (playVideo && camera.hasStream) {
                     const video = document.createElement('video');
                     video.className = 'camera-video';
                     video.muted = true;
@@ -284,11 +311,16 @@
                     cell.title = 'Клик — полноэкранный режим';
                     cell.addEventListener('click', () => toggleFullscreen(cell));
 
-                    setTimeout(() => initHLSPlayer(video, camera.streamUrl, key), 50);
+                    initHLSPlayer(video, camera.streamUrl, key);
                 } else {
                     const ph = document.createElement('div');
                     ph.className = 'video-placeholder';
-                    ph.textContent = '📷';
+                    if (!playVideo && camera.hasStream) {
+                        ph.textContent = '▶';
+                        ph.title = 'Откройте секцию для просмотра';
+                    } else {
+                        ph.textContent = '📷';
+                    }
                     videoBox.appendChild(ph);
                 }
 
@@ -466,7 +498,7 @@
                 const res = await fetch('/api/configs/' + id, { method: 'DELETE' });
                 if (!res.ok) { alert('Не удалось удалить конфигурацию'); return; }
                 configs = configs.filter(c => c.id !== id);
-                if (activeId === id) activeId = 'all';
+                if (activeId === id) activeId = defaultActiveId();
                 renderTabs();
                 render(true);
             } catch (e) {
@@ -478,6 +510,7 @@
 
         async function refresh() {
             allCameras = await fetchCameras();
+            renderTabs();
             render(false);
         }
 
@@ -486,10 +519,20 @@
         async function init() {
             configs = await fetchConfigs();
             allCameras = await fetchCameras();
+            activeId = defaultActiveId();
             renderTabs();
             render(true);
 
             refreshTimer = setInterval(refresh, 10000);
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    destroyPlayers();
+                } else if (isVideoTab(activeId)) {
+                    lastSignature = '';
+                    render(true);
+                }
+            });
             window.addEventListener('resize', () => optimizeGridLayout(camerasForActive().length));
 
             $('btnAdd').addEventListener('click', openModal);
