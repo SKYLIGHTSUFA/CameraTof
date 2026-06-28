@@ -21,47 +21,61 @@
 
 Выполняется один раз на машине с интернетом (или на CI), чтобы потом работать офлайн.
 
-### 1.1. Собрать backend
+### Быстрый способ (один скрипт)
 
 ```bash
 cd /path/to/backend_20260519
+chmod +x scripts/*.sh
 
-# Если базового образа ещё нет — полная сборка с нуля:
-# docker build -f Dockerfile -t gige-hls:galaxysdk-v2
-
-# Сборка рабочего образа (поверх v2 или уже загруженного tar):
-docker compose build
+# Нужен Galaxy SDK в папке Galaxy_Linux-x86_Gige-U3_.../ (см. Dockerfile)
+./scripts/offline-prepare.sh
 ```
 
-Образ: `gige-hls:galaxysdk-v3`
+Скрипт по порядку:
+1. Скачивает Python-пакеты в `whl/` (`download-python-wheels.sh`)
+2. Собирает backend (`Dockerfile` → v2, `Dockerfile_install_libs` → v3)
+3. Собирает frontend
+4. Сохраняет образы в `offline/images/*.tar`
 
-### 1.2. Собрать frontend (видеостена)
+### Пошагово (если нужен контроль)
+
+**1. Python-зависимости в whl/:**
 
 ```bash
-cd video_new/nof-front-camera
-docker compose build
-cd ../..
+./scripts/download-python-wheels.sh
 ```
 
-Образ: `gige-hls-front:latest`
+Скачивает `numpy`, `harvesters`, `genicam`, `pyzmq` в `whl/` через образ `sazonovanton/ffmpeg-opencv-cuda:12.1.1-cudnn8-runtime-python3.11`.
 
-### 1.3. Сохранить образы для офлайн-сервера
+**2. Собрать backend:**
 
 ```bash
-chmod +x scripts/docker-save-images.sh scripts/docker-load-images.sh
+docker build -f Dockerfile -t gige-hls:galaxysdk-v2 .
+docker compose build   # → gige-hls:galaxysdk-v3
+```
+
+**3. Собрать frontend:**
+
+```bash
+cd video_new/nof-front-camera && docker compose build && cd ../..
+```
+
+**4. Сохранить образы:**
+
+```bash
 ./scripts/docker-save-images.sh
 ```
 
-Создаст папку `offline/images/`:
+### Что копировать на офлайн-сервер
 
-```
-offline/images/
-├── gige-hls-backend.tar   # backend
-├── gige-hls-front.tar     # видеостена
-└── images.env             # имена образов
-```
+| Обязательно | Зачем |
+|-------------|-------|
+| `offline/images/` | Docker-образы |
+| `app.py`, `config.json`, `docker-compose.yml` | Backend |
+| `video_new/nof-front-camera/` | Видеостена |
+| `scripts/offline-deploy.sh`, `scripts/docker-load-images.sh` | Запуск |
 
-Скопируйте **всю папку `offline/images/`** на production-сервер (флешка, scp, rsync).
+`whl/` и `Galaxy_Linux-.../` нужны только для **пересборки** образов на сервере. Для обычного запуска достаточно `offline/images/*.tar`.
 
 > Файлы `*.tar` в git не хранятся (см. `.gitignore`).
 
@@ -69,52 +83,38 @@ offline/images/
 
 ## Этап 2. Запуск офлайн (без интернета)
 
-На production-сервере должны быть: Docker, `nvidia-container-toolkit`, сеть к камерам, RAM-диск.
+На production-сервере: Docker, `nvidia-container-toolkit`, сеть к камерам.
 
-### 2.1. Загрузить образы
+### Быстрый способ
 
 ```bash
 cd /path/to/backend_20260519
+chmod +x scripts/*.sh
+
+# Отредактируйте config.json перед запуском
+./scripts/offline-deploy.sh
+```
+
+Скрипт: загрузит образы → создаст сеть `apps` → смонтирует RAM-диск → поднимет backend и frontend.
+
+Переменные окружения (опционально):
+
+```bash
+RAMDISK=/mnt/test_ramdisk RAMDISK_SIZE=8G ./scripts/offline-deploy.sh
+```
+
+### Вручную
+
+```bash
 ./scripts/docker-load-images.sh
-```
-
-### 2.2. Подготовить конфиг и RAM-диск
-
-1. Отредактировать `config.json` (`camera_mapping`, `fps_target`, `max_camera_fps`…)
-2. Создать RAM-диск (если ещё нет):
-
-```bash
-sudo mkdir -p /mnt/test_ramdisk
-sudo mount -t tmpfs -o size=4G tmpfs /mnt/test_ramdisk
-```
-
-### 2.3. Запустить backend
-
-```bash
+docker network create apps 2>/dev/null || true
+sudo mount -t tmpfs -o size=4G tmpfs /mnt/test_ramdisk  # если ещё нет
 docker compose up -d --no-build
-docker logs -f gige-hls-galaxysdk
+cd video_new/nof-front-camera && docker compose up -d --no-build
 ```
 
-HLS пишется в `/mnt/test_ramdisk/camera_91.1.1/index.m3u8` и т.д.
-
-### 2.4. Запустить видеостену
-
-```bash
-cd video_new/nof-front-camera
-docker compose up -d --no-build
-```
-
-Открыть в браузере: `http://<IP_сервера>:4000/`
-
-Поток одной камеры: `http://<IP>:4000/hls/camera_91.1.1/index.m3u8`
-
-### 2.5. Сеть Docker для frontend
-
-Перед первым запуском frontend создайте сеть (если её нет):
-
-```bash
-docker network create apps
-```
+Открыть: `http://<IP_сервера>:4000/`  
+HLS: `/mnt/test_ramdisk/camera_91.1.1/index.m3u8`
 
 ---
 
@@ -129,7 +129,9 @@ docker network create apps
 | `max_camera_fps` | Потолок FPS (защита сети), по умолчанию 10 |
 | `software_fps_limit` | Программный throttle в Python, по умолчанию `false` |
 | `use_nvenc` | `true` — кодирование на GPU |
-| `zmq_enabled` | `false` — отключить ZMQ, если не нужен инференс |
+| `zmq_enabled` | `false` — отключить ZMQ, если не нужен инференс (foam) |
+| `zmq_inference_fps` | Лимит full-frame в ZMQ (2 = 2 кадра/сек на камеру) |
+| `zmq_inference_burst_pairs` | `true` — раз в сек парой подряд идущих кадров |
 | `camera_mapping` | Имя камеры → ID (`91.1.1` → папка `camera_91.1.1`) |
 
 Секции на видеостене берутся автоматически из первой части ID: `91.1.1` → секция **91**.
@@ -149,58 +151,18 @@ docker network create apps
 
 ---
 
-## Какие файлы нужны, а какие нет
-
-### Нужны для production (GPU)
-
-| Файл / папка | Назначение |
-|--------------|------------|
-| `app.py` | Backend захвата |
-| `config.json` | Конфигурация камер |
-| `docker-compose.yml` | Backend на GPU |
-| `Dockerfile`, `Dockerfile_install_libs` | Сборка образа backend |
-| `requirements.txt`, `whl/` | Python-зависимости |
-| `Galaxy_Linux-.../` | SDK Daheng (для сборки) |
-| `video_new/nof-front-camera/` | Видеостена |
-| `scripts/docker-save-images.sh` | Сохранение образов (онлайн) |
-| `scripts/docker-load-images.sh` | Загрузка образов (офлайн) |
-
-### Можно удалить (не нужны для GigE + GPU)
-
-| Файл / папка | Почему |
-|--------------|--------|
-| `docker-compose.cpu.yml` | Только CPU, без NVENC — вам не нужен |
-| `test_config.json` | Тестовый конфиг на 1 камеру |
-| `video_new/video/`, `video_2/`, `VIDEO_ALL/` | Старая RTSP-схема |
-| `Hls/` | Старые RTSP frontend/go |
-| `video_new/*.tar` | Локальные бэкапы образов (держать на сервере, не в git) |
-| `app_20260427.py`, `config_20260518.json` и т.п. | Старые бэкапы, если есть |
-
-### Опционально (для отладки, не для production)
-
-| Файл | Назначение |
-|------|------------|
-| `test_video_capture.py` | Просмотр кадров из ZMQ — только если `zmq_enabled: true` |
-| `profile.sh` | Профилирование `py-spy`, не для обычного запуска |
-
----
-
 ## Быстрая шпаргалка
 
 **Тест видеостены без камер (Linux):** см. [video_new/nof-front-camera/README.md](video_new/nof-front-camera/README.md)
 
 **Онлайн (подготовка):**
 ```bash
-docker compose build
-cd video_new/nof-front-camera && docker compose build && cd ../..
-./scripts/docker-save-images.sh
+./scripts/offline-prepare.sh
 ```
 
 **Офлайн (production):**
 ```bash
-./scripts/docker-load-images.sh
-docker compose up -d --no-build
-cd video_new/nof-front-camera && docker compose up -d --no-build
+./scripts/offline-deploy.sh
 ```
 
 **Проверка:**
