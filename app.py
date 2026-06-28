@@ -91,6 +91,10 @@ FETCH_TIMEOUT_S = config.get("fetch_timeout_s", _timeout_us / 1_000_000)
 ZMQ_ENABLED = config.get("zmq_enabled", True)
 ZMQ_PORT_BASE = config.get("zmq_port_base", 5555)
 ZMQ_FORMAT = config.get("zmq_format", "raw") # "raw" or "jpeg" (or nvjpeg)
+# 0 = send every capture frame; 2 = max 2 full frames/sec per camera (for foam inference)
+ZMQ_INFERENCE_FPS = float(config.get("zmq_inference_fps", 0))
+# True: every 2/zmq_inference_fps sec send 2 consecutive capture frames back-to-back
+ZMQ_INFERENCE_BURST_PAIRS = bool(config.get("zmq_inference_burst_pairs", False))
 
 # =========================
 # СООТВЕТСТВИЕ DISPLAY_NAME -> ID
@@ -539,6 +543,93 @@ class CameraWorker:
         self.pixel_format = "Unknown"
         self._use_cuda_debayer = _CV2_CUDA_AVAILABLE
 
+        self._zmq_prev_capture = None
+        self._zmq_last_publish = 0.0
+
+    @staticmethod
+    def _copy_for_zmq(raw):
+        if isinstance(raw, np.ndarray):
+            return raw.copy()
+        return bytes(raw)
+
+    def _send_zmq_frame(self, raw, now: float, width: int, height: int) -> bool:
+        if self.zmq_socket is None:
+            return False
+        is_np = isinstance(raw, np.ndarray)
+        try:
+            if ZMQ_FORMAT in ("jpeg", "nvjpeg"):
+                if is_np:
+                    img_to_encode = raw
+                else:
+                    c_shape, _ = detect_frame_shape_and_dtype(self.pixel_format, width, height, len(raw))
+                    img_to_encode = np.frombuffer(raw, dtype=np.uint8).reshape(c_shape)
+
+                ret, encoded = cv2.imencode('.jpg', img_to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ret:
+                    return False
+                msg_bytes = encoded.tobytes()
+                meta = {
+                    "camera_id": self.camera_id,
+                    "display_name": self.display_name,
+                    "timestamp": now,
+                    "format": "jpeg",
+                    "pixel_format": self.pixel_format
+                }
+            else:
+                if is_np:
+                    c_shape = raw.shape
+                    dtype_str = str(raw.dtype)
+                    msg_bytes = raw.data if raw.flags["C_CONTIGUOUS"] else np.ascontiguousarray(raw).data
+                else:
+                    c_shape, _ = detect_frame_shape_and_dtype(self.pixel_format, width, height, len(raw))
+                    dtype_str = "uint8"
+                    msg_bytes = raw
+                meta = {
+                    "camera_id": self.camera_id,
+                    "display_name": self.display_name,
+                    "timestamp": now,
+                    "format": "raw",
+                    "shape": c_shape,
+                    "dtype": dtype_str,
+                    "pixel_format": self.pixel_format
+                }
+            topic = f"cam_{self.camera_id}".encode('ascii')
+            self.zmq_socket.send(topic, zmq.SNDMORE)
+            self.zmq_socket.send_json(meta, zmq.SNDMORE)
+            self.zmq_socket.send(msg_bytes, copy=False)
+            return True
+        except Exception as e:
+            if self.fetch_count == 0:
+                print(f"[CAM {self.camera_id}] ZMQ Send error: {e}")
+            return False
+
+    def _maybe_publish_zmq(self, raw, now: float, width: int, height: int):
+        if self.zmq_socket is None:
+            return
+
+        if ZMQ_INFERENCE_FPS <= 0:
+            self._send_zmq_frame(raw, now, width, height)
+            return
+
+        if ZMQ_INFERENCE_BURST_PAIRS:
+            burst_interval = 2.0 / ZMQ_INFERENCE_FPS
+            prev = self._zmq_prev_capture
+            self._zmq_prev_capture = self._copy_for_zmq(raw)
+            if prev is None:
+                return
+            if now - self._zmq_last_publish < burst_interval:
+                return
+            self._zmq_last_publish = now
+            self._send_zmq_frame(prev, now, width, height)
+            self._send_zmq_frame(raw, now, width, height)
+            return
+
+        min_interval = 1.0 / ZMQ_INFERENCE_FPS
+        if now - self._zmq_last_publish < min_interval:
+            return
+        self._zmq_last_publish = now
+        self._send_zmq_frame(raw, now, width, height)
+
     def _debayer_cuda(self, bayer: np.ndarray, key: str) -> np.ndarray:
         """GPU demosaicing: raw Bayer uint8 (H,W) → BGR uint8 (H,W,3).
 
@@ -738,58 +829,7 @@ class CameraWorker:
                                 f"extra={total - frame_bytes}"
                             )
 
-                    # Publish to ZMQ for inference
-                    if self.zmq_socket is not None:
-                        is_np = isinstance(raw, np.ndarray)
-                        try:
-                            # HW / Software JPEG encoding
-                            if ZMQ_FORMAT in ("jpeg", "nvjpeg"):
-                                if is_np:
-                                    img_to_encode = raw
-                                else:
-                                    c_shape, _ = detect_frame_shape_and_dtype(self.pixel_format, width, height, len(raw))
-                                    img_to_encode = np.frombuffer(raw, dtype=np.uint8).reshape(c_shape)
-                                
-                                ret, encoded = cv2.imencode('.jpg', img_to_encode, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                                if ret:
-                                    msg_bytes = encoded.tobytes()
-                                    meta = {
-                                        "camera_id": self.camera_id,
-                                        "display_name": self.display_name,
-                                        "timestamp": now,
-                                        "format": "jpeg",
-                                        "pixel_format": self.pixel_format
-                                    }
-                                    topic = f"cam_{self.camera_id}".encode('ascii')
-                                    self.zmq_socket.send(topic, zmq.SNDMORE)
-                                    self.zmq_socket.send_json(meta, zmq.SNDMORE)
-                                    self.zmq_socket.send(msg_bytes)
-                            else:
-                                # Raw mode - uncompressed array
-                                if is_np:
-                                    c_shape = raw.shape
-                                    dtype_str = str(raw.dtype)
-                                    msg_bytes = raw.data if raw.flags["C_CONTIGUOUS"] else np.ascontiguousarray(raw).data
-                                else:
-                                    c_shape, _ = detect_frame_shape_and_dtype(self.pixel_format, width, height, len(raw))
-                                    dtype_str = "uint8"
-                                    msg_bytes = raw
-                                meta = {
-                                    "camera_id": self.camera_id,
-                                    "display_name": self.display_name,
-                                    "timestamp": now,
-                                    "format": "raw",
-                                    "shape": c_shape,
-                                    "dtype": dtype_str,
-                                    "pixel_format": self.pixel_format
-                                }
-                                topic = f"cam_{self.camera_id}".encode('ascii')
-                                self.zmq_socket.send(topic, zmq.SNDMORE)
-                                self.zmq_socket.send_json(meta, zmq.SNDMORE)
-                                self.zmq_socket.send(msg_bytes, copy=False)
-                        except Exception as e:
-                            if self.fetch_count == 0:
-                                print(f"[CAM {self.camera_id}] ZMQ Send error: {e}")
+                    self._maybe_publish_zmq(raw, now, width, height)
 
                     # Atomic drop-oldest + push: avoids the race where encode
                     # drains the queue between our get_nowait and put_nowait.
@@ -990,6 +1030,13 @@ def main():
             xsub = zmq_ctx.socket(zmq.XSUB)
             xsub.bind("inproc://zmq_workers")
             threading.Thread(target=zmq.proxy, args=(xsub, xpub), daemon=True, name="ZMQ_Proxy").start()
+            if ZMQ_INFERENCE_FPS > 0:
+                mode = (
+                    f"burst pairs every {2.0 / ZMQ_INFERENCE_FPS:.2f}s"
+                    if ZMQ_INFERENCE_BURST_PAIRS
+                    else f"{ZMQ_INFERENCE_FPS:.1f} fps throttle"
+                )
+                print(f"   ZMQ inference limit: {mode}")
             print(f"\n🚀 ZMQ XPUB bound on port {ZMQ_PORT_BASE}. All cameras publish here via topics.")
         except Exception as e:
             print(f"\n⚠️ ZMQ Proxy init failed: {e}")
