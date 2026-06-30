@@ -6,6 +6,8 @@ services:
     image: gige-hls:galaxysdk-v3
     #image: redos8-python311-cuda:cupy-py-spy
     container_name: gige-hls-galaxysdk
+    init: true
+    stop_grace_period: 30s
     volumes:
       - ./app.py:/app/app.py:ro
       - ./config.json:/app/config.json:ro

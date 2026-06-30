@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Видеостена</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/hls.js"></script>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">VW</div>
+            <div class="brand-text">
+                <span class="brand-title">Видеостена</span>
+                <span class="brand-sub" id="brandSub">Мониторинг камер</span>
+            </div>
+        </div>
+        <div class="tabs" id="tabs"></div>
+        <button class="btn-add" id="btnAdd" type="button">+ Добавить</button>
+    </header>
+
+    <main class="stage">
+        <div id="gridContainer" class="camera-grid">
+            <div class="loading"><div class="spinner"></div></div>
+        </div>
+    </main>
+
+    <footer class="statusbar" id="statusBar">
+        <span id="statusText">Загрузка…</span>
+    </footer>
+
+    <!-- Окно создания конфигурации -->
+    <div class="modal-overlay" id="modal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+            <h2 class="modal-title" id="modalTitle">Новая конфигурация</h2>
+
+            <div class="modal-section">
+                <div class="modal-label">Камеры</div>
+                <div class="checklist" id="checklist"></div>
+            </div>
+
+            <div class="modal-section">
+                <label class="modal-label" for="configName">Название конфигурации</label>
+                <input type="text" id="configName" class="modal-input"
+                       placeholder="Например: Камера флотации" maxlength="60" autocomplete="off">
+            </div>
+
+            <div class="modal-error" id="modalError" hidden></div>
+
+            <div class="modal-actions">
+                <button class="btn btn-ghost" id="btnCancel" type="button">Отмена</button>
+                <button class="btn btn-primary" id="btnSave" type="button">Сохранить</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const MAX_CONFIGS = 7;
+
+        let allCameras = [];      // все камеры (папки в streams)
+        let configs = [];         // сохранённые конфигурации
+        let activeId = null;      // id активной вкладки (секция / конфиг)
+        let players = {};         // HLS-плееры только активной вкладки
+        let lastSignature = '';
+        let refreshTimer = null;
+
+        const $ = (id) => document.getElementById(id);
+
+        /** Видео грузим только на вкладке секции/конфига, не на «Все камеры». */
+        function isVideoTab(id) {
+            return id && id !== 'all';
+        }
+
+        function defaultActiveId() {
+            const firstSection = configs.find(c => c.builtin && c.id.startsWith('section:'));
+            return firstSection ? firstSection.id : (configs[0]?.id || 'all');
+        }
+
+        // ---------- Загрузка данных ----------
+
+        async function fetchCameras() {
+            try {
+                const res = await fetch('/api/cameras');
+                return res.ok ? await res.json() : [];
+            } catch (e) {
+                console.error('Error fetching cameras:', e);
+                return [];
+            }
+        }
+
+        async function fetchConfigs() {
+            try {
+                const res = await fetch('/api/configs');
+                return res.ok ? await res.json() : [];
+            } catch (e) {
+                console.error('Error fetching configs:', e);
+                return [];
+            }
+        }
+
+        // ---------- Статистика и вкладки ----------
+
+        function getTabStats(id) {
+            let list;
+            if (id === 'all') {
+                list = allCameras;
+            } else {
+                const cfg = configs.find(c => c.id === id);
+                if (!cfg) return { online: 0, total: 0 };
+                const byId = new Map(allCameras.map(c => [c.id, c]));
+                list = cfg.cameras.map(camId => byId.get(camId) || { hasStream: false });
+            }
+            const total = list.length;
+            const online = list.filter(c => c.hasStream).length;
+            return { online, total };
+        }
+
+        function updateStatusBar() {
+            const viewList = camerasForActive();
+            const viewOnline = viewList.filter(c => c.hasStream).length;
+            const viewTotal = viewList.length;
+            const total = allCameras.length;
+            const online = allCameras.filter(c => c.hasStream).length;
+            const offline = total - online;
+            const timeStr = new Date().toLocaleTimeString('ru-RU', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            const viewLabel = isVideoTab(activeId)
+                ? ` · на экране ${viewOnline}/${viewTotal}`
+                : '';
+            $('statusText').textContent =
+                `${total} камер · ${online} online · ${offline} offline${viewLabel} · обновлено ${timeStr}`;
+        }
+
+        function updateBrandSub() {
+            const cfg = configs.find(c => c.id === activeId);
+            const stats = getTabStats(activeId);
+            if (activeId === 'all') {
+                $('brandSub').textContent = `Все камеры · ${stats.online}/${stats.total} online`;
+            } else if (cfg) {
+                $('brandSub').textContent = `${cfg.name} · ${stats.online}/${stats.total} online`;
+            }
+        }
+
+        function renderTabs() {
+            const tabs = $('tabs');
+            tabs.innerHTML = '';
+
+            tabs.appendChild(makeTab('all', 'Все камеры', false));
+            configs.forEach(cfg => tabs.appendChild(makeTab(cfg.id, cfg.name, !cfg.builtin)));
+
+            const savedCount = configs.filter(cfg => !cfg.builtin).length;
+            const atLimit = savedCount >= MAX_CONFIGS;
+            $('btnAdd').disabled = atLimit;
+            $('btnAdd').title = atLimit ? `Достигнут лимит в ${MAX_CONFIGS} конфигураций` : '';
+            updateBrandSub();
+        }
+
+        function makeTab(id, label, deletable) {
+            const tab = document.createElement('div');
+            tab.className = 'tab' + (id === activeId ? ' active' : '');
+
+            const name = document.createElement('button');
+            name.type = 'button';
+            name.className = 'tab-name';
+            name.textContent = label;
+            name.addEventListener('click', () => setActive(id));
+            tab.appendChild(name);
+
+            const stats = getTabStats(id);
+            const badge = document.createElement('span');
+            badge.className = 'tab-badge';
+            if (stats.total > 0 && stats.online === stats.total) {
+                badge.classList.add('all-online');
+            } else if (stats.online === 0 && stats.total > 0) {
+                badge.classList.add('none-online');
+            }
+            badge.textContent = `${stats.online}/${stats.total}`;
+            badge.title = `${stats.online} online из ${stats.total}`;
+            tab.appendChild(badge);
+
+            if (deletable) {
+                const del = document.createElement('button');
+                del.type = 'button';
+                del.className = 'tab-del';
+                del.textContent = '✕';
+                del.title = 'Удалить конфигурацию';
+                del.addEventListener('click', (ev) => deleteConfig(id, label, ev));
+                tab.appendChild(del);
+            }
+            return tab;
+        }
+
+        function setActive(id) {
+            if (activeId === id) return;
+            destroyPlayers();
+            lastSignature = '';
+            activeId = id;
+            renderTabs();
+            render(true);
+        }
+
+        // ---------- Какие камеры показывать ----------
+
+        function camerasForActive() {
+            if (activeId === 'all') return allCameras;
+
+            const cfg = configs.find(c => c.id === activeId);
+            if (!cfg) return allCameras;
+
+            const byId = new Map(allCameras.map(c => [c.id, c]));
+            // Сохраняем порядок из конфигурации; отсутствующие сейчас
+            // камеры показываем как офлайн, а не прячем.
+            return cfg.cameras.map(camName => byId.get(camName) || {
+                id: camName,
+                name: camName.replace(/^camera_/, ''),
+                section: (camName.replace(/^camera_/, '').split('.')[0] || camName),
+                hasStream: false,
+                streamUrl: `/hls/${encodeURIComponent(camName)}/index.m3u8`
+            });
+        }
+
+        function signatureOf(list) {
+            return activeId + '|' + list.map(c => `${c.id}:${c.hasStream ? 1 : 0}`).join(',');
+        }
+
+        // ---------- Отрисовка сетки ----------
+
+        /** Линия = первые два сегмента имени (90.2 из 90.2.4) */
+        function getLineKey(camera) {
+            if (camera.line) return camera.line;
+            const name = camera.name || camera.id.replace(/^camera_/, '');
+            const parts = name.split('.');
+            if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+            return name;
+        }
+
+        function groupCamerasByLine(cameras) {
+            const groups = new Map();
+            cameras.forEach(cam => {
+                const key = getLineKey(cam);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(cam);
+            });
+            return Array.from(groups.entries())
+                .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+                .map(([lineKey, lineCams]) => ({
+                    lineKey,
+                    cameras: lineCams.sort((a, b) =>
+                        (a.name || '').localeCompare(b.name || '', undefined, { numeric: true })
+                    )
+                }));
+        }
+
+        function render(force) {
+            const list = camerasForActive();
+            const sig = signatureOf(list);
+            // Если набор камер не изменился — не пересобираем сетку,
+            // чтобы видео не перезапускалось каждые 10 секунд.
+            if (!force && sig === lastSignature) {
+                updateStatusBar();
+                updateBrandSub();
+                return;
+            }
+            lastSignature = sig;
+            renderCameraGrid(list);
+            optimizeGridLayout();
+            updateStatusBar();
+            updateBrandSub();
+        }
+
+        function destroyPlayers() {
+            Object.values(players).forEach(p => { try { p.destroy(); } catch (e) {} });
+            players = {};
+        }
+
+        function renderCameraGrid(cameras) {
+            const container = $('gridContainer');
+            destroyPlayers();
+
+            if (!cameras || cameras.length === 0) {
+                container.innerHTML = '<div class="empty">Нет камер для отображения</div>';
+                return;
+            }
+
+            const playVideo = isVideoTab(activeId);
+            container.innerHTML = '';
+
+            if (!playVideo) {
+                const hint = document.createElement('div');
+                hint.className = 'all-tab-hint';
+                hint.textContent = 'Обзор без видео — выберите секцию для просмотра потоков';
+                container.appendChild(hint);
+            }
+
+            const lineGroups = groupCamerasByLine(cameras);
+
+            lineGroups.forEach(({ lineKey, cameras: lineCams }) => {
+                const row = document.createElement('div');
+                row.className = 'camera-line-row';
+                row.dataset.line = lineKey;
+                row.style.gridTemplateColumns = `repeat(${lineCams.length}, 1fr)`;
+
+                lineCams.forEach((camera) => {
+                    const key = `${activeId}-${camera.id}`;
+
+                    const cell = document.createElement('div');
+                    cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
+                    if (!playVideo) cell.classList.add('no-video');
+
+                    const header = document.createElement('div');
+                    header.className = 'camera-header';
+
+                    const cName = document.createElement('span');
+                    cName.className = 'camera-name';
+                    cName.textContent = camera.name;
+
+                    const status = document.createElement('span');
+                    status.className = 'camera-status ' + (camera.hasStream ? 'online' : 'offline');
+                    status.textContent = camera.hasStream ? '● LIVE' : '○ OFF';
+
+                    header.appendChild(cName);
+                    header.appendChild(status);
+
+                    const videoBox = document.createElement('div');
+                    videoBox.className = 'video-container';
+
+                    if (playVideo && camera.hasStream) {
+                        const video = document.createElement('video');
+                        video.className = 'camera-video';
+                        video.muted = true;
+                        video.playsInline = true;
+                        video.autoplay = true;
+                        videoBox.appendChild(video);
+
+                        const fsHint = document.createElement('span');
+                        fsHint.className = 'fs-hint';
+                        fsHint.textContent = '⛶';
+                        fsHint.title = 'Полный экран';
+                        videoBox.appendChild(fsHint);
+
+                        cell.title = 'Клик — полноэкранный режим';
+                        cell.addEventListener('click', () => toggleFullscreen(cell));
+
+                        initHLSPlayer(video, camera.streamUrl, key);
+                    } else {
+                        const ph = document.createElement('div');
+                        ph.className = 'video-placeholder';
+                        if (!playVideo && camera.hasStream) {
+                            ph.textContent = '▶';
+                            ph.title = 'Откройте секцию для просмотра';
+                        } else {
+                            ph.textContent = '📷';
+                        }
+                        videoBox.appendChild(ph);
+                    }
+
+                    cell.appendChild(header);
+                    cell.appendChild(videoBox);
+                    row.appendChild(cell);
+                });
+
+                container.appendChild(row);
+            });
+        }
+
+        function optimizeGridLayout() {
+            const grid = $('gridContainer');
+            const rows = grid.querySelectorAll('.camera-line-row');
+            if (!rows.length) {
+                grid.style.gridTemplateColumns = '1fr';
+                return;
+            }
+
+            const vw = grid.clientWidth || window.innerWidth;
+            const vh = grid.clientHeight || (window.innerHeight - 52 - 28);
+            const gap = 8;
+            const rowGap = 8;
+            const aspect = 16 / 9;
+            const rowCount = rows.length;
+            const availH = (vh - rowGap * (rowCount - 1)) / rowCount;
+
+            rows.forEach(row => {
+                const count = row.children.length;
+                const cellW = (vw - gap * Math.max(0, count - 1)) / count;
+                const cellHByWidth = cellW / aspect;
+                const rowH = Math.min(cellHByWidth, availH);
+                row.style.height = `${Math.max(rowH, 80)}px`;
+            });
+        }
+
+        function toggleFullscreen(cell) {
+            if (!cell.classList.contains('is-online')) return;
+            if (document.fullscreenElement === cell) {
+                document.exitFullscreen().catch(() => {});
+            } else {
+                cell.requestFullscreen().catch(() => {});
+            }
+        }
+
+        function initHLSPlayer(videoElement, streamUrl, key) {
+            if (players[key]) { try { players[key].destroy(); } catch (e) {} delete players[key]; }
+
+            if (window.Hls && Hls.isSupported()) {
+                const hls = new Hls({
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    backBufferLength: 15,
+                    maxBufferLength: 15,
+                    liveSyncDurationCount: 2,
+                    liveMaxLatencyDurationCount: 4
+                });
+                hls.loadSource(streamUrl);
+                hls.attachMedia(videoElement);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => videoElement.play().catch(() => {}));
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (!data.fatal) return;
+                    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+                    else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+                    else hls.destroy();
+                });
+                players[key] = hls;
+            } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
+                videoElement.src = streamUrl;
+                videoElement.addEventListener('loadedmetadata', () => videoElement.play().catch(() => {}));
+            }
+        }
+
+        // ---------- Модальное окно ----------
+
+        function savedConfigCount() {
+            return configs.filter(cfg => !cfg.builtin).length;
+        }
+
+        async function openModal() {
+            if (savedConfigCount() >= MAX_CONFIGS) return;
+            $('modalError').hidden = true;
+            $('configName').value = '';
+            const list = $('checklist');
+            list.innerHTML = '<div class="muted">Загрузка камер…</div>';
+            $('modal').hidden = false;
+
+            const cams = await fetchCameras();
+            list.innerHTML = '';
+            if (cams.length === 0) {
+                list.innerHTML = '<div class="muted">Камеры не найдены</div>';
+                return;
+            }
+            const bySection = new Map();
+            cams.forEach(c => {
+                const section = c.section || 'other';
+                if (!bySection.has(section)) bySection.set(section, []);
+                bySection.get(section).push(c);
+            });
+
+            Array.from(bySection.entries())
+                .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+                .forEach(([section, sectionCams]) => {
+                    const title = document.createElement('div');
+                    title.className = 'check-section';
+                    title.textContent = `Секция ${section}`;
+                    list.appendChild(title);
+
+                    sectionCams.forEach(c => {
+                        const row = document.createElement('label');
+                        row.className = 'check-row';
+
+                        const cb = document.createElement('input');
+                        cb.type = 'checkbox';
+                        cb.value = c.id;
+
+                        const nm = document.createElement('span');
+                        nm.className = 'check-name';
+                        nm.textContent = c.name;
+
+                        const dot = document.createElement('span');
+                        dot.className = 'dot ' + (c.hasStream ? 'online' : 'offline');
+                        dot.title = c.hasStream ? 'Онлайн' : 'Офлайн';
+
+                        row.appendChild(cb);
+                        row.appendChild(nm);
+                        row.appendChild(dot);
+                        list.appendChild(row);
+                    });
+                });
+            setTimeout(() => $('configName').focus(), 50);
+        }
+
+        function closeModal() { $('modal').hidden = true; }
+
+        function showModalError(msg) {
+            const el = $('modalError');
+            el.textContent = msg;
+            el.hidden = false;
+        }
+
+        async function saveConfig() {
+            const name = $('configName').value.trim();
+            const cameras = Array.from($('checklist').querySelectorAll('input[type=checkbox]:checked'))
+                .map(cb => cb.value);
+
+            if (cameras.length === 0) return showModalError('Выберите хотя бы одну камеру');
+            if (!name) return showModalError('Введите название конфигурации');
+            if (savedConfigCount() >= MAX_CONFIGS) return showModalError(`Достигнут лимит в ${MAX_CONFIGS} конфигураций`);
+
+            try {
+                const res = await fetch('/api/configs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, cameras })
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    return showModalError(err.error || 'Не удалось сохранить');
+                }
+                const created = await res.json();
+                configs.push(created);
+                closeModal();
+                setActive(created.id);
+            } catch (e) {
+                showModalError('Ошибка сети при сохранении');
+            }
+        }
+
+        async function deleteConfig(id, label, ev) {
+            ev.stopPropagation();
+            if (!confirm(`Удалить конфигурацию «${label}»?`)) return;
+            try {
+                const res = await fetch('/api/configs/' + id, { method: 'DELETE' });
+                if (!res.ok) { alert('Не удалось удалить конфигурацию'); return; }
+                configs = configs.filter(c => c.id !== id);
+                if (activeId === id) activeId = defaultActiveId();
+                renderTabs();
+                render(true);
+            } catch (e) {
+                alert('Ошибка сети при удалении');
+            }
+        }
+
+        // ---------- Автообновление ----------
+
+        async function refresh() {
+            allCameras = await fetchCameras();
+            renderTabs();
+            render(false);
+        }
+
+        // ---------- Инициализация ----------
+
+        async function init() {
+            configs = await fetchConfigs();
+            allCameras = await fetchCameras();
+            activeId = defaultActiveId();
+            renderTabs();
+            render(true);
+
+            refreshTimer = setInterval(refresh, 10000);
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) {
+                    destroyPlayers();
+                } else if (isVideoTab(activeId)) {
+                    lastSignature = '';
+                    render(true);
+                }
+            });
+            window.addEventListener('resize', () => optimizeGridLayout());
+
+            $('btnAdd').addEventListener('click', openModal);
+            $('btnCancel').addEventListener('click', closeModal);
+            $('btnSave').addEventListener('click', saveConfig);
+            $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    if (!$('modal').hidden) closeModal();
+                    else if (document.fullscreenElement) document.exitFullscreen();
+                }
+            });
+            $('configName').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveConfig(); });
+        }
+
+        window.addEventListener('beforeunload', () => {
+            if (refreshTimer) clearInterval(refreshTimer);
+            destroyPlayers();
+        });
+
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

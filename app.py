@@ -8,6 +8,7 @@ import threading
 import subprocess
 import traceback
 import json
+import signal
 import zmq
 
 import numpy as np
@@ -951,6 +952,12 @@ def list_cameras(h: Harvester) -> list:
 # MAIN
 # =========================
 def main():
+    def _shutdown_handler(signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
         print("✅ FFmpeg найден")
