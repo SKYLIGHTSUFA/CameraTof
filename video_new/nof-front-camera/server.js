@@ -47,6 +47,14 @@ function getSectionFromCameraId(folderName) {
     return dot > 0 ? shortId.slice(0, dot) : shortId;
 }
 
+/** Линия = первые два сегмента ID, например 90.2 из 90.2.4 */
+function getLineFromCameraId(folderName) {
+    const shortId = stripCameraPrefix(folderName);
+    const parts = shortId.split('.');
+    if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+    return shortId;
+}
+
 function findPlaylistFile(cameraPath) {
     for (const fileName of ['index.m3u8', 'stream.m3u8']) {
         if (fs.existsSync(path.join(cameraPath, fileName))) return fileName;
@@ -86,6 +94,7 @@ function getCameraData(folderName) {
         id: folderName,
         name: shortId,
         section: getSectionFromCameraId(folderName),
+        line: getLineFromCameraId(folderName),
         streamUrl: `/hls/${encodeURIComponent(folderName)}/${playlistFile}`,
         hasStream: fs.existsSync(m3u8Path)
     };
@@ -116,6 +125,8 @@ function getCameras(filterIds = null) {
         return cameras.sort((a, b) => {
             const sectionCompare = a.section.localeCompare(b.section, undefined, { numeric: true });
             if (sectionCompare !== 0) return sectionCompare;
+            const lineCompare = a.line.localeCompare(b.line, undefined, { numeric: true });
+            if (lineCompare !== 0) return lineCompare;
             return a.name.localeCompare(b.name, undefined, { numeric: true });
         });
     } catch (error) {
@@ -140,9 +151,13 @@ function getBuiltinSectionConfigs(cameras = getCameras()) {
             id: `section:${section}`,
             name: `Секция ${section}`,
             builtin: true,
-            cameras: cameraIds.sort((a, b) =>
-                stripCameraPrefix(a).localeCompare(stripCameraPrefix(b), undefined, { numeric: true })
-            )
+            cameras: cameraIds.sort((a, b) => {
+                const lineA = getLineFromCameraId(a);
+                const lineB = getLineFromCameraId(b);
+                const lineCompare = lineA.localeCompare(lineB, undefined, { numeric: true });
+                if (lineCompare !== 0) return lineCompare;
+                return stripCameraPrefix(a).localeCompare(stripCameraPrefix(b), undefined, { numeric: true });
+            })
         }));
 }
 

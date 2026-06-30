@@ -229,6 +229,32 @@
 
         // ---------- Отрисовка сетки ----------
 
+        /** Линия = первые два сегмента имени (90.2 из 90.2.4) */
+        function getLineKey(camera) {
+            if (camera.line) return camera.line;
+            const name = camera.name || camera.id.replace(/^camera_/, '');
+            const parts = name.split('.');
+            if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+            return name;
+        }
+
+        function groupCamerasByLine(cameras) {
+            const groups = new Map();
+            cameras.forEach(cam => {
+                const key = getLineKey(cam);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(cam);
+            });
+            return Array.from(groups.entries())
+                .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
+                .map(([lineKey, lineCams]) => ({
+                    lineKey,
+                    cameras: lineCams.sort((a, b) =>
+                        (a.name || '').localeCompare(b.name || '', undefined, { numeric: true })
+                    )
+                }));
+        }
+
         function render(force) {
             const list = camerasForActive();
             const sig = signatureOf(list);
@@ -241,7 +267,7 @@
             }
             lastSignature = sig;
             renderCameraGrid(list);
-            optimizeGridLayout(list.length);
+            optimizeGridLayout();
             updateStatusBar();
             updateBrandSub();
         }
@@ -270,92 +296,100 @@
                 container.appendChild(hint);
             }
 
-            cameras.forEach((camera, index) => {
-                const key = `${activeId}-${camera.id}`;
+            const lineGroups = groupCamerasByLine(cameras);
 
-                const cell = document.createElement('div');
-                cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
-                if (!playVideo) cell.classList.add('no-video');
+            lineGroups.forEach(({ lineKey, cameras: lineCams }) => {
+                const row = document.createElement('div');
+                row.className = 'camera-line-row';
+                row.dataset.line = lineKey;
+                row.style.gridTemplateColumns = `repeat(${lineCams.length}, 1fr)`;
 
-                const header = document.createElement('div');
-                header.className = 'camera-header';
+                lineCams.forEach((camera) => {
+                    const key = `${activeId}-${camera.id}`;
 
-                const cName = document.createElement('span');
-                cName.className = 'camera-name';
-                cName.textContent = camera.name;
+                    const cell = document.createElement('div');
+                    cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
+                    if (!playVideo) cell.classList.add('no-video');
 
-                const status = document.createElement('span');
-                status.className = 'camera-status ' + (camera.hasStream ? 'online' : 'offline');
-                status.textContent = camera.hasStream ? '● LIVE' : '○ OFF';
+                    const header = document.createElement('div');
+                    header.className = 'camera-header';
 
-                header.appendChild(cName);
-                header.appendChild(status);
+                    const cName = document.createElement('span');
+                    cName.className = 'camera-name';
+                    cName.textContent = camera.name;
 
-                const videoBox = document.createElement('div');
-                videoBox.className = 'video-container';
+                    const status = document.createElement('span');
+                    status.className = 'camera-status ' + (camera.hasStream ? 'online' : 'offline');
+                    status.textContent = camera.hasStream ? '● LIVE' : '○ OFF';
 
-                if (playVideo && camera.hasStream) {
-                    const video = document.createElement('video');
-                    video.className = 'camera-video';
-                    video.muted = true;
-                    video.playsInline = true;
-                    video.autoplay = true;
-                    videoBox.appendChild(video);
+                    header.appendChild(cName);
+                    header.appendChild(status);
 
-                    const fsHint = document.createElement('span');
-                    fsHint.className = 'fs-hint';
-                    fsHint.textContent = '⛶';
-                    fsHint.title = 'Полный экран';
-                    videoBox.appendChild(fsHint);
+                    const videoBox = document.createElement('div');
+                    videoBox.className = 'video-container';
 
-                    cell.title = 'Клик — полноэкранный режим';
-                    cell.addEventListener('click', () => toggleFullscreen(cell));
+                    if (playVideo && camera.hasStream) {
+                        const video = document.createElement('video');
+                        video.className = 'camera-video';
+                        video.muted = true;
+                        video.playsInline = true;
+                        video.autoplay = true;
+                        videoBox.appendChild(video);
 
-                    initHLSPlayer(video, camera.streamUrl, key);
-                } else {
-                    const ph = document.createElement('div');
-                    ph.className = 'video-placeholder';
-                    if (!playVideo && camera.hasStream) {
-                        ph.textContent = '▶';
-                        ph.title = 'Откройте секцию для просмотра';
+                        const fsHint = document.createElement('span');
+                        fsHint.className = 'fs-hint';
+                        fsHint.textContent = '⛶';
+                        fsHint.title = 'Полный экран';
+                        videoBox.appendChild(fsHint);
+
+                        cell.title = 'Клик — полноэкранный режим';
+                        cell.addEventListener('click', () => toggleFullscreen(cell));
+
+                        initHLSPlayer(video, camera.streamUrl, key);
                     } else {
-                        ph.textContent = '📷';
+                        const ph = document.createElement('div');
+                        ph.className = 'video-placeholder';
+                        if (!playVideo && camera.hasStream) {
+                            ph.textContent = '▶';
+                            ph.title = 'Откройте секцию для просмотра';
+                        } else {
+                            ph.textContent = '📷';
+                        }
+                        videoBox.appendChild(ph);
                     }
-                    videoBox.appendChild(ph);
-                }
 
-                cell.appendChild(header);
-                cell.appendChild(videoBox);
-                container.appendChild(cell);
+                    cell.appendChild(header);
+                    cell.appendChild(videoBox);
+                    row.appendChild(cell);
+                });
+
+                container.appendChild(row);
             });
         }
 
-        function optimizeGridLayout(count) {
+        function optimizeGridLayout() {
             const grid = $('gridContainer');
-            if (count === 0) { grid.style.gridTemplateColumns = '1fr'; return; }
+            const rows = grid.querySelectorAll('.camera-line-row');
+            if (!rows.length) {
+                grid.style.gridTemplateColumns = '1fr';
+                return;
+            }
 
             const vw = grid.clientWidth || window.innerWidth;
             const vh = grid.clientHeight || (window.innerHeight - 52 - 28);
-            const aspect = 16 / 9;
             const gap = 8;
+            const rowGap = 8;
+            const aspect = 16 / 9;
+            const rowCount = rows.length;
+            const availH = (vh - rowGap * (rowCount - 1)) / rowCount;
 
-            let bestCols = Math.ceil(Math.sqrt(count));
-            let minWaste = Infinity;
-
-            for (let cols = 1; cols <= Math.min(8, count); cols++) {
-                const rows = Math.ceil(count / cols);
-                const cellW = (vw - gap * (cols - 1)) / cols;
-                const cellH = cellW / aspect;
-                const totalH = cellH * rows + gap * (rows - 1);
-                if (totalH <= vh + 60) {
-                    const waste = (vh - totalH);
-                    if (waste >= 0 && waste < minWaste) {
-                        minWaste = waste;
-                        bestCols = cols;
-                    }
-                }
-            }
-            grid.style.gridTemplateColumns = `repeat(${bestCols}, 1fr)`;
+            rows.forEach(row => {
+                const count = row.children.length;
+                const cellW = (vw - gap * Math.max(0, count - 1)) / count;
+                const cellHByWidth = cellW / aspect;
+                const rowH = Math.min(cellHByWidth, availH);
+                row.style.height = `${Math.max(rowH, 80)}px`;
+            });
         }
 
         function toggleFullscreen(cell) {
@@ -533,7 +567,7 @@
                     render(true);
                 }
             });
-            window.addEventListener('resize', () => optimizeGridLayout(camerasForActive().length));
+            window.addEventListener('resize', () => optimizeGridLayout());
 
             $('btnAdd').addEventListener('click', openModal);
             $('btnCancel').addEventListener('click', closeModal);
