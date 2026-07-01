@@ -89,6 +89,11 @@ GENTL_BUFFER_COUNT = config.get("gentl_buffer_count", config.get("aravis_buffer_
 _timeout_us = config.get("aravis_pop_timeout_us", 1_500_000)
 FETCH_TIMEOUT_S = config.get("fetch_timeout_s", _timeout_us / 1_000_000)
 
+# Нет кадров дольше этого порога — очистка HLS и переподключение камеры
+STREAM_STALE_SEC = float(config.get("stream_stale_sec", 30))
+RECONNECT_ENABLED = config.get("reconnect_enabled", True)
+RECONNECT_RETRY_SEC = float(config.get("reconnect_retry_sec", 120))
+
 ZMQ_ENABLED = config.get("zmq_enabled", True)
 ZMQ_PORT_BASE = config.get("zmq_port_base", 5555)
 ZMQ_FORMAT = config.get("zmq_format", "raw") # "raw" or "jpeg" (or nvjpeg)
@@ -400,17 +405,20 @@ class HLSStreamer:
             os.path.join(self.output_dir, "index.m3u8"),
         ]
 
-    def start(self, src_pix_fmt: str, src_w: int, src_h: int):
-        self.src_pix_fmt = src_pix_fmt
-        self.src_w = src_w
-        self.src_h = src_h
-
+    def purge_files(self):
         for f in os.listdir(self.output_dir):
             if f.endswith(".ts") or f == "index.m3u8":
                 try:
                     os.remove(os.path.join(self.output_dir, f))
                 except Exception:
                     pass
+
+    def start(self, src_pix_fmt: str, src_w: int, src_h: int):
+        self.src_pix_fmt = src_pix_fmt
+        self.src_w = src_w
+        self.src_h = src_h
+
+        self.purge_files()
 
         cmd = self._build_cmd()
 
@@ -507,7 +515,17 @@ class CameraWorker:
         }
         del _cuda_ns
 
-    def __init__(self, device, camera_id: str, display_name: str, use_nvenc: bool, gpu_id: int = 0, zmq_ctx: zmq.Context | None = None):
+    def __init__(
+        self,
+        device,
+        camera_id: str,
+        display_name: str,
+        use_nvenc: bool,
+        gpu_id: int = 0,
+        zmq_ctx: zmq.Context | None = None,
+        harvester: Harvester | None = None,
+        device_index: int = -1,
+    ):
         self.device       = device      # harvesters ImageAcquirer
         self.camera_id    = camera_id
         self.display_name = display_name
@@ -515,6 +533,12 @@ class CameraWorker:
         self.running      = True
         self.zmq_ctx      = zmq_ctx
         self.zmq_socket   = None
+        self.harvester    = harvester
+        self.device_index = device_index
+        self._device_lock = threading.Lock()
+        self._stale_lock = threading.Lock()
+        self._acquisition_start_time = 0.0
+        self._last_stale_action = 0.0
 
         # Setup ZMQ interface for low latency inference (connecting to inproc proxy)
         if self.zmq_ctx is not None:
@@ -666,8 +690,14 @@ class CameraWorker:
             bgr = np.ascontiguousarray(bgr)
         return bgr
 
-    def capture(self):
-        print(f"[CAM {self.display_name} ({self.camera_id})] 📷 START capture")
+    def _drain_frame_queue(self):
+        while True:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _setup_device(self) -> bool:
         try:
             try_set_camera_params(self.device, f"{self.display_name} ({self.camera_id})")
 
@@ -676,6 +706,92 @@ class CameraWorker:
             except Exception:
                 self.pixel_format = "BayerRG8"
 
+            self.device.num_buffers = GENTL_BUFFER_COUNT
+            self.device.start()
+            time.sleep(0.3)
+            self._acquisition_start_time = time.time()
+            return True
+        except Exception as e:
+            print(f"[CAM {self.display_name} ({self.camera_id})] ❌ device setup error: {e}")
+            return False
+
+    def _reconnect_device(self) -> bool:
+        if not RECONNECT_ENABLED or self.harvester is None or self.device_index < 0:
+            return False
+
+        with self._device_lock:
+            try:
+                self.device.stop()
+            except Exception:
+                pass
+            try:
+                self.device.destroy()
+            except Exception:
+                pass
+
+            try:
+                self.harvester.update()
+            except Exception as e:
+                print(
+                    f"[CAM {self.display_name} ({self.camera_id})] "
+                    f"⚠️ harvester.update failed: {e}"
+                )
+
+            device = open_camera_with_retry(self.harvester, self.device_index)
+            if device is None:
+                return False
+
+            self.device = device
+            return self._setup_device()
+
+    def _check_stream_stale(self, now: float):
+        if not RECONNECT_ENABLED or STREAM_STALE_SEC <= 0:
+            return
+
+        if not self._stale_lock.acquire(blocking=False):
+            return
+        try:
+            if self.last_frame_time > 0:
+                ref_time = self.last_frame_time
+            elif self._acquisition_start_time > 0:
+                ref_time = self._acquisition_start_time
+            else:
+                return
+
+            stale_for = now - ref_time
+            if stale_for < STREAM_STALE_SEC:
+                return
+
+            if now - self._last_stale_action < RECONNECT_RETRY_SEC:
+                return
+            self._last_stale_action = now
+
+            print(
+                f"[CAM {self.display_name} ({self.camera_id})] "
+                f"⚠️ поток устарел ({stale_for:.0f}s без кадров) — очистка HLS и переподключение..."
+            )
+            self.hls.stop()
+            self.hls.purge_files()
+            self._drain_frame_queue()
+
+            if self._reconnect_device():
+                print(
+                    f"[CAM {self.display_name} ({self.camera_id})] "
+                    f"✅ камера переподключена"
+                )
+                self.last_frame_time = 0.0
+                self._acquisition_start_time = time.time()
+            else:
+                print(
+                    f"[CAM {self.display_name} ({self.camera_id})] "
+                    f"❌ переподключение не удалось, повтор через {RECONNECT_RETRY_SEC:.0f}s"
+                )
+        finally:
+            self._stale_lock.release()
+
+    def capture(self):
+        print(f"[CAM {self.display_name} ({self.camera_id})] 📷 START capture")
+        try:
             # Bind GPU context for this thread and probe cv2.cuda.demosaicing
             if self._use_cuda_debayer:
                 try:
@@ -704,10 +820,9 @@ class CameraWorker:
                     print(f"[CAM {self.display_name} ({self.camera_id})] ⚠️ cv2.cuda.setDevice({self.gpu_id}) failed: {e}")
                     self._use_cuda_debayer = False
 
-            # Configure buffer pool then start acquisition
-            self.device.num_buffers = GENTL_BUFFER_COUNT
-            self.device.start()
-            time.sleep(0.3)
+            if not self._setup_device():
+                self.running = False
+                return
 
         except Exception as e:
             print(f"[CAM {self.display_name} ({self.camera_id})] ❌ start error: {e}")
@@ -715,138 +830,140 @@ class CameraWorker:
             return
 
         while self.running:
+            self._check_stream_stale(time.time())
             try:
-                with self.device.fetch(timeout=FETCH_TIMEOUT_S) as buf:
-                    if buf is None or not buf.payload.components:
-                        continue
+                with self._device_lock:
+                    with self.device.fetch(timeout=FETCH_TIMEOUT_S) as buf:
+                        if buf is None or not buf.payload.components:
+                            continue
 
-                    comp = buf.payload.components[0]
-                    width  = comp.width
-                    height = comp.height
+                        comp = buf.payload.components[0]
+                        width  = comp.width
+                        height = comp.height
 
-                    if width <= 0 or height <= 0:
-                        continue
+                        if width <= 0 or height <= 0:
+                            continue
 
-                    now = time.time()
-                    if (
-                        SOFTWARE_FPS_LIMIT
-                        and self.frame_interval > 0
-                        and now - self.last_frame_time < self.frame_interval
-                    ):
-                        self.fetch_count += 1
-                        continue
-
-                    # comp.data is a numpy 1-D uint8 view on the internal buffer.
-                    # Everything that leaves this `with` block MUST be a copy.
-                    data = comp.data
-                    if data is None or data.size == 0:
-                        continue
-
-                    key = (self.pixel_format or "").upper().replace("_", "")
-                    bayer_keys = {"BAYERRG8", "BAYERBG8", "BAYERGB8", "BAYERGR8"}
-                    is_bayer   = key in bayer_keys and cv2 is not None
-
-                    if not self.hls.running:
-                        src_fmt = "bgr24" if is_bayer else genicam_to_ffmpeg_pixfmt(self.pixel_format)
-                        self.hls.start(src_fmt, width, height)
-
-                    if is_bayer:
-                        total_bytes    = data.size
-                        expected_bytes = width * height
-
-                        if total_bytes == expected_bytes:
-                            # .copy() because data is a view on Harvesters' internal buffer;
-                            # the buffer is returned to the pool on `with` exit.
-                            raw_bayer = data.reshape(height, width).copy()
-                        elif (
-                            total_bytes > expected_bytes
-                            and total_bytes % height == 0
-                            and (total_bytes // height) >= width
-                            and (total_bytes // height) % 4 == 0
+                        now = time.time()
+                        if (
+                            SOFTWARE_FPS_LIMIT
+                            and self.frame_interval > 0
+                            and now - self.last_frame_time < self.frame_interval
                         ):
-                            stride_pixels = total_bytes // height
-                            padded = data.reshape(height, stride_pixels)
-                            # np.ascontiguousarray on a non-contiguous slice already copies
-                            raw_bayer = np.ascontiguousarray(padded[:, :width])
-                        else:
-                            raw_bayer = data[:expected_bytes].reshape(height, width).copy()
+                            self.fetch_count += 1
+                            continue
 
-                        if self.fetch_count == 0:
-                            print(
-                                f"[CAM {self.display_name} ({self.camera_id})] "
-                                f"Bayer buffer: size={total_bytes}, expected={expected_bytes}, "
-                                f"width={width}, height={height}, "
-                                f"stride={total_bytes // height if height else 0}"
-                            )
+                        # comp.data is a numpy 1-D uint8 view on the internal buffer.
+                        # Everything that leaves this `with` block MUST be a copy.
+                        data = comp.data
+                        if data is None or data.size == 0:
+                            continue
 
-                        # Debayer → BGR24 (result is always a fresh array, safe to queue)
-                        if self._use_cuda_debayer:
-                            try:
-                                raw = self._debayer_cuda(raw_bayer, key)
-                            except Exception as e:
+                        key = (self.pixel_format or "").upper().replace("_", "")
+                        bayer_keys = {"BAYERRG8", "BAYERBG8", "BAYERGB8", "BAYERGR8"}
+                        is_bayer   = key in bayer_keys and cv2 is not None
+
+                        if not self.hls.running:
+                            src_fmt = "bgr24" if is_bayer else genicam_to_ffmpeg_pixfmt(self.pixel_format)
+                            self.hls.start(src_fmt, width, height)
+
+                        if is_bayer:
+                            total_bytes    = data.size
+                            expected_bytes = width * height
+
+                            if total_bytes == expected_bytes:
+                                # .copy() because data is a view on Harvesters' internal buffer;
+                                # the buffer is returned to the pool on `with` exit.
+                                raw_bayer = data.reshape(height, width).copy()
+                            elif (
+                                total_bytes > expected_bytes
+                                and total_bytes % height == 0
+                                and (total_bytes // height) >= width
+                                and (total_bytes // height) % 4 == 0
+                            ):
+                                stride_pixels = total_bytes // height
+                                padded = data.reshape(height, stride_pixels)
+                                # np.ascontiguousarray on a non-contiguous slice already copies
+                                raw_bayer = np.ascontiguousarray(padded[:, :width])
+                            else:
+                                raw_bayer = data[:expected_bytes].reshape(height, width).copy()
+
+                            if self.fetch_count == 0:
                                 print(
                                     f"[CAM {self.display_name} ({self.camera_id})] "
-                                    f"⚠️ GPU debayer failed, fallback to CPU OpenCV: {e}"
+                                    f"Bayer buffer: size={total_bytes}, expected={expected_bytes}, "
+                                    f"width={width}, height={height}, "
+                                    f"stride={total_bytes // height if height else 0}"
                                 )
-                                self._use_cuda_debayer = False
-                                raw = self._debayer_cpu(raw_bayer, key)
-                        else:
-                            raw = self._debayer_cpu(raw_bayer, key)
 
-                    else:
-                        # Non-Bayer: strip stride/padding/chunk bytes, then copy
-                        shape, dtype = detect_frame_shape_and_dtype(
-                            self.pixel_format, width, height, data.size
-                        )
-                        bpp       = shape[2] if len(shape) == 3 else 1
-                        row_bytes = width * bpp
-                        frame_bytes = row_bytes * height
-                        total     = data.size
-
-                        if total == frame_bytes:
-                            raw = bytes(data)
-                        elif (
-                            total > frame_bytes
-                            and total % height == 0
-                            and (total // height) > row_bytes
-                            and (total // height) % 4 == 0
-                        ):
-                            stride_bytes  = total // height
-                            stride_pixels = stride_bytes // bpp
-                            if len(shape) == 2:
-                                padded = data[:stride_pixels * height].reshape(height, stride_pixels)
-                                raw = np.ascontiguousarray(padded[:, :width]).tobytes()
+                            # Debayer → BGR24 (result is always a fresh array, safe to queue)
+                            if self._use_cuda_debayer:
+                                try:
+                                    raw = self._debayer_cuda(raw_bayer, key)
+                                except Exception as e:
+                                    print(
+                                        f"[CAM {self.display_name} ({self.camera_id})] "
+                                        f"⚠️ GPU debayer failed, fallback to CPU OpenCV: {e}"
+                                    )
+                                    self._use_cuda_debayer = False
+                                    raw = self._debayer_cpu(raw_bayer, key)
                             else:
-                                padded = data[:stride_pixels * height * bpp].reshape(height, stride_pixels, bpp)
-                                raw = np.ascontiguousarray(padded[:, :width, :]).tobytes()
+                                raw = self._debayer_cpu(raw_bayer, key)
+
                         else:
-                            raw = bytes(data[:frame_bytes])
-
-                        if self.fetch_count == 0:
-                            print(
-                                f"[CAM {self.display_name} ({self.camera_id})] "
-                                f"CPU buffer: size={total}, frame_bytes={frame_bytes}, "
-                                f"width={width}, height={height}, bpp={bpp}, "
-                                f"extra={total - frame_bytes}"
+                            # Non-Bayer: strip stride/padding/chunk bytes, then copy
+                            shape, dtype = detect_frame_shape_and_dtype(
+                                self.pixel_format, width, height, data.size
                             )
+                            bpp       = shape[2] if len(shape) == 3 else 1
+                            row_bytes = width * bpp
+                            frame_bytes = row_bytes * height
+                            total     = data.size
 
-                    self._maybe_publish_zmq(raw, now, width, height)
+                            if total == frame_bytes:
+                                raw = bytes(data)
+                            elif (
+                                total > frame_bytes
+                                and total % height == 0
+                                and (total // height) > row_bytes
+                                and (total // height) % 4 == 0
+                            ):
+                                stride_bytes  = total // height
+                                stride_pixels = stride_bytes // bpp
+                                if len(shape) == 2:
+                                    padded = data[:stride_pixels * height].reshape(height, stride_pixels)
+                                    raw = np.ascontiguousarray(padded[:, :width]).tobytes()
+                                else:
+                                    padded = data[:stride_pixels * height * bpp].reshape(height, stride_pixels, bpp)
+                                    raw = np.ascontiguousarray(padded[:, :width, :]).tobytes()
+                            else:
+                                raw = bytes(data[:frame_bytes])
 
-                    # Atomic drop-oldest + push: avoids the race where encode
-                    # drains the queue between our get_nowait and put_nowait.
-                    while True:
-                        try:
-                            self.q.put_nowait(raw)
-                            break
-                        except queue.Full:
+                            if self.fetch_count == 0:
+                                print(
+                                    f"[CAM {self.display_name} ({self.camera_id})] "
+                                    f"CPU buffer: size={total}, frame_bytes={frame_bytes}, "
+                                    f"width={width}, height={height}, bpp={bpp}, "
+                                    f"extra={total - frame_bytes}"
+                                )
+
+                        self._maybe_publish_zmq(raw, now, width, height)
+
+                        # Atomic drop-oldest + push: avoids the race where encode
+                        # drains the queue between our get_nowait and put_nowait.
+                        while True:
                             try:
-                                self.q.get_nowait()
-                                self._drop_count += 1
-                            except queue.Empty:
+                                self.q.put_nowait(raw)
                                 break
+                            except queue.Full:
+                                try:
+                                    self.q.get_nowait()
+                                    self._drop_count += 1
+                                except queue.Empty:
+                                    break
 
-                    self.last_frame_time = now
-                    self.fetch_count += 1
+                        self.last_frame_time = now
+                        self.fetch_count += 1
 
                 now = time.time()
                 if now - self.last_fetch_log >= 5.0:
@@ -859,11 +976,13 @@ class CameraWorker:
                     self.last_fetch_log = now
 
             except gentl.TimeoutException:
+                self._check_stream_stale(time.time())
                 continue
             except Exception as e:
                 if not self.running:
                     break
                 print(f"[CAM {self.display_name} ({self.camera_id})] fetch error: {e}")
+                self._check_stream_stale(time.time())
                 time.sleep(0.1)
 
     def encode(self):
@@ -885,6 +1004,7 @@ class CameraWorker:
 
             except queue.Empty:
                 now = time.time()
+                self._check_stream_stale(now)
                 if now - self.last_empty_log > 5.0:
                     print(f"[CAM {self.display_name} ({self.camera_id})] ⏳ нет кадров...")
                     self.last_empty_log = now
@@ -1060,7 +1180,9 @@ def main():
             info["display_name"],
             use_nvenc,
             gpu_id,
-            zmq_ctx=zmq_ctx
+            zmq_ctx=zmq_ctx,
+            harvester=h,
+            device_index=info["index"],
         )
         workers.append(w)
 
@@ -1078,6 +1200,11 @@ def main():
     print("▶️  СИСТЕМА ЗАПУЩЕНА")
     enc_label = "h264_nvenc (GPU)" if use_nvenc else "libx264 (CPU)"
     print(f"🖥️  Энкодер: {enc_label}")
+    if RECONNECT_ENABLED and STREAM_STALE_SEC > 0:
+        print(
+            f"🔄 Автопереподключение: вкл "
+            f"(порог {STREAM_STALE_SEC:.0f}s без кадров, повтор {RECONNECT_RETRY_SEC:.0f}s)"
+        )
     print(f"📁 HLS: {BASE_OUTPUT_DIR}/")
     for w in workers:
         print(f"   • {w.display_name} -> camera_{w.camera_id}/index.m3u8")

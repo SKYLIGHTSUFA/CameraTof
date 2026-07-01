@@ -218,6 +218,7 @@
                 id: camName,
                 name: camName.replace(/^camera_/, ''),
                 section: (camName.replace(/^camera_/, '').split('.')[0] || camName),
+                line: getLineKey({ id: camName, name: camName.replace(/^camera_/, '') }),
                 hasStream: false,
                 streamUrl: `/hls/${encodeURIComponent(camName)}/index.m3u8`
             });
@@ -231,8 +232,7 @@
 
         /** Линия = первые два сегмента имени (90.2 из 90.2.4) */
         function getLineKey(camera) {
-            if (camera.line) return camera.line;
-            const name = camera.name || camera.id.replace(/^camera_/, '');
+            const name = (camera.name || camera.id || '').replace(/^camera_/, '');
             const parts = name.split('.');
             if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
             return name;
@@ -255,7 +255,30 @@
                 }));
         }
 
-        function render(force) {
+        function formatMetrics(metrics) {
+            if (!metrics) return { count: '—', area: '—' };
+            const count = metrics.bubbleCount != null ? String(metrics.bubbleCount) : '—';
+            let area = '—';
+            if (metrics.areaCm2 != null) {
+                area = `${metrics.areaCm2.toFixed(2)} см²`;
+            } else if (metrics.areaPx2 != null) {
+                area = `${Math.round(metrics.areaPx2)} px²`;
+            }
+            return { count, area };
+        }
+
+        function updateMetricsInGrid() {
+            const byId = new Map(allCameras.map(c => [c.id, c]));
+            document.querySelectorAll('.camera-cell[data-camera-id]').forEach(cell => {
+                const camera = byId.get(cell.dataset.cameraId);
+                const { count, area } = formatMetrics(camera?.metrics);
+                const countEl = cell.querySelector('[data-metric="count"]');
+                const areaEl = cell.querySelector('[data-metric="area"]');
+                if (countEl) countEl.textContent = count;
+                if (areaEl) areaEl.textContent = area;
+            });
+        }
+
             const list = camerasForActive();
             const sig = signatureOf(list);
             // Если набор камер не изменился — не пересобираем сетку,
@@ -309,10 +332,14 @@
 
                     const cell = document.createElement('div');
                     cell.className = 'camera-cell' + (camera.hasStream ? ' is-online' : ' is-offline');
+                    cell.dataset.cameraId = camera.id;
                     if (!playVideo) cell.classList.add('no-video');
 
                     const header = document.createElement('div');
                     header.className = 'camera-header';
+
+                    const headerMain = document.createElement('div');
+                    headerMain.className = 'camera-header-main';
 
                     const cName = document.createElement('span');
                     cName.className = 'camera-name';
@@ -322,8 +349,31 @@
                     status.className = 'camera-status ' + (camera.hasStream ? 'online' : 'offline');
                     status.textContent = camera.hasStream ? '● LIVE' : '○ OFF';
 
-                    header.appendChild(cName);
-                    header.appendChild(status);
+                    headerMain.appendChild(cName);
+                    headerMain.appendChild(status);
+
+                    const metricsRow = document.createElement('div');
+                    metricsRow.className = 'camera-metrics';
+
+                    const countMetric = document.createElement('span');
+                    countMetric.className = 'metric metric-count';
+                    countMetric.title = 'Среднее количество пузырей за минуту';
+                    countMetric.innerHTML = 'Кол-во пузырей: <span data-metric="count">—</span>';
+
+                    const areaMetric = document.createElement('span');
+                    areaMetric.className = 'metric metric-area';
+                    areaMetric.title = 'Средняя площадь пузырей за минуту';
+                    areaMetric.innerHTML = 'Средняя площадь: <span data-metric="area">—</span>';
+
+                    metricsRow.appendChild(countMetric);
+                    metricsRow.appendChild(areaMetric);
+
+                    header.appendChild(headerMain);
+                    header.appendChild(metricsRow);
+
+                    const { count, area } = formatMetrics(camera.metrics);
+                    countMetric.querySelector('[data-metric="count"]').textContent = count;
+                    areaMetric.querySelector('[data-metric="area"]').textContent = area;
 
                     const videoBox = document.createElement('div');
                     videoBox.className = 'video-container';
@@ -376,7 +426,11 @@
             }
 
             const vw = grid.clientWidth || window.innerWidth;
-            const vh = grid.clientHeight || (window.innerHeight - 52 - 28);
+            const rootStyle = getComputedStyle(document.documentElement);
+            const chromeH =
+                (parseInt(rootStyle.getPropertyValue('--topbar-h'), 10) || 60) +
+                (parseInt(rootStyle.getPropertyValue('--statusbar-h'), 10) || 36);
+            const vh = grid.clientHeight || (window.innerHeight - chromeH);
             const gap = 8;
             const rowGap = 8;
             const aspect = 16 / 9;
@@ -546,6 +600,7 @@
             allCameras = await fetchCameras();
             renderTabs();
             render(false);
+            updateMetricsInGrid();
         }
 
         // ---------- Инициализация ----------

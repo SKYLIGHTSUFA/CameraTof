@@ -20,6 +20,12 @@ services:
       - CONFIG_FILE=/app/config.json
       - CAMERA_FOLDER_PREFIX=camera_
       - CHOKIDAR_USEPOLLING=true
+      - FOAM_METRICS_ENABLED=true
+      - FOAM_DB_HOST=postgres
+      - FOAM_DB_PORT=5432
+      - FOAM_DB_NAME=foam_v2
+      - FOAM_DB_USER=postgres
+      - FOAM_DB_PASSWORD=NoCh5ae5ahgh
     networks:
       - apps
 

@@ -26,6 +26,24 @@ const CAMERA_FOLDER_PREFIX = process.env.CAMERA_FOLDER_PREFIX || 'camera_';
 const CONFIGS_FILE = path.join(DATA_DIR, 'configs.json');
 const MAX_CONFIGS = 7;
 
+function loadStreamStaleSec() {
+    if (process.env.STREAM_STALE_SEC) {
+        const parsed = Number(process.env.STREAM_STALE_SEC);
+        if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+    }
+    if (CONFIG_FILE && fs.existsSync(CONFIG_FILE)) {
+        try {
+            const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            if (typeof config.stream_stale_sec === 'number' && config.stream_stale_sec > 0) {
+                return config.stream_stale_sec;
+            }
+        } catch (_) {}
+    }
+    return 30;
+}
+
+const STREAM_STALE_SEC = loadStreamStaleSec();
+
 function isInside(parent, child) {
     const relative = path.relative(parent, child);
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -62,6 +80,43 @@ function findPlaylistFile(cameraPath) {
     return 'index.m3u8';
 }
 
+function getLatestSegmentMtime(cameraPath) {
+    if (!fs.existsSync(cameraPath)) return 0;
+
+    let latest = 0;
+    try {
+        for (const name of fs.readdirSync(cameraPath)) {
+            if (!name.endsWith('.ts')) continue;
+            const stat = fs.statSync(path.join(cameraPath, name));
+            if (stat.mtimeMs > latest) latest = stat.mtimeMs;
+        }
+    } catch (_) {}
+
+    return latest;
+}
+
+function isStreamFresh(cameraPath, m3u8Path) {
+    const lastSegmentAt = getLatestSegmentMtime(cameraPath);
+    if (lastSegmentAt > 0) {
+        return {
+            lastSegmentAt,
+            hasStream: (Date.now() - lastSegmentAt) < STREAM_STALE_SEC * 1000
+        };
+    }
+
+    if (fs.existsSync(m3u8Path)) {
+        try {
+            const mtime = fs.statSync(m3u8Path).mtimeMs;
+            return {
+                lastSegmentAt: mtime,
+                hasStream: (Date.now() - mtime) < STREAM_STALE_SEC * 1000
+            };
+        } catch (_) {}
+    }
+
+    return { lastSegmentAt: null, hasStream: false };
+}
+
 function loadExpectedCameraIds() {
     if (!CONFIG_FILE || !fs.existsSync(CONFIG_FILE)) return [];
 
@@ -89,6 +144,7 @@ function getCameraData(folderName) {
     const playlistFile = findPlaylistFile(cameraPath);
     const m3u8Path = path.join(cameraPath, playlistFile);
     const shortId = stripCameraPrefix(folderName);
+    const { lastSegmentAt, hasStream } = isStreamFresh(cameraPath, m3u8Path);
 
     return {
         id: folderName,
@@ -96,7 +152,8 @@ function getCameraData(folderName) {
         section: getSectionFromCameraId(folderName),
         line: getLineFromCameraId(folderName),
         streamUrl: `/hls/${encodeURIComponent(folderName)}/${playlistFile}`,
-        hasStream: fs.existsSync(m3u8Path)
+        hasStream,
+        lastSegmentAt
     };
 }
 
@@ -291,6 +348,7 @@ app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     console.log(`Cameras dir: ${HLS_OUTPUT_DIR}`);
     console.log(`Config file: ${CONFIG_FILE || '(not set)'}`);
+    console.log(`Stream stale threshold: ${STREAM_STALE_SEC}s`);
     console.log(`Configs file: ${CONFIGS_FILE}`);
     console.log(`Cameras: ${cameras.length}, sections: ${sections.length}`);
 
