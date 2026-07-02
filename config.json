@@ -20,7 +20,7 @@
   "fetch_timeout_s": 1.5,
   "stream_stale_sec": 30,
   "foam_metrics": {
-    "enabled": true,
+    "enabled": false,
     "window_minutes": 1,
     "refresh_sec": 15,
     "database_host": "postgres",

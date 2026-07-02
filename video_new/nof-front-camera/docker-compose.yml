@@ -6,7 +6,7 @@ services:
     container_name: gige-hls-front
     restart: unless-stopped
     ports:
-      - "4000:4000"
+      - "4010:4010"
     volumes:
       # Та же папка, куда backend пишет HLS (в docker-compose backend: /mnt/test_ramdisk)
       - /mnt/test_ramdisk:/hls_output:ro
@@ -15,12 +15,12 @@ services:
       - ./data:/app/data
     environment:
       - NODE_ENV=production
-      - PORT=4000
+      - PORT=4010
       - HLS_OUTPUT_DIR=/hls_output
       - CONFIG_FILE=/app/config.json
       - CAMERA_FOLDER_PREFIX=camera_
       - CHOKIDAR_USEPOLLING=true
-      - FOAM_METRICS_ENABLED=true
+      - FOAM_METRICS_ENABLED=false
       - FOAM_DB_HOST=postgres
       - FOAM_DB_PORT=5432
       - FOAM_DB_NAME=foam_v2

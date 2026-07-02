@@ -19,7 +19,7 @@ try {
 }
 
 const app = express();
-const PORT = Number(process.env.PORT || 4000);
+const PORT = Number(process.env.PORT || 4010);
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -89,7 +89,11 @@ function loadFoamMetricsConfig() {
             merged[key] = value;
         }
     }
-    if (fromFile.enabled === true && process.env.FOAM_METRICS_ENABLED !== 'false') {
+    if (process.env.FOAM_METRICS_ENABLED === 'false') {
+        merged.enabled = false;
+    } else if (process.env.FOAM_METRICS_ENABLED === 'true') {
+        merged.enabled = true;
+    } else if (fromFile.enabled === true) {
         merged.enabled = true;
     }
     merged.database_port = Number(merged.database_port || 5432);
@@ -185,9 +189,26 @@ async function getFoamMetrics(force = false) {
         return { metrics: data, enabled: true, error: null };
     } catch (error) {
         console.error('Foam metrics query failed:', error.message);
-        metricsCache.error = error.message;
+        metricsCache = {
+            data: metricsCache.data,
+            fetchedAt: Date.now(),
+            error: error.message
+        };
         return { metrics: metricsCache.data, enabled: true, error: error.message };
     }
+}
+
+function getCachedFoamMetrics() {
+    return metricsCache.data || {};
+}
+
+function refreshFoamMetricsInBackground() {
+    if (!FOAM_METRICS.enabled) return;
+    const ttlMs = Math.max(5000, (Number(FOAM_METRICS.refresh_sec) || 15) * 1000);
+    if (metricsCache.fetchedAt && (Date.now() - metricsCache.fetchedAt) < ttlMs) return;
+    getFoamMetrics().catch((error) => {
+        console.error('Foam metrics background refresh failed:', error.message);
+    });
 }
 
 function isInside(parent, child) {
@@ -390,7 +411,7 @@ function saveConfigs(configs) {
     fs.writeFileSync(CONFIGS_FILE, JSON.stringify(configs, null, 2), 'utf8');
 }
 
-app.get('/api/cameras', async (req, res) => {
+app.get('/api/cameras', (req, res) => {
     let filterIds = null;
     if (req.query.ids) {
         filterIds = req.query.ids.split('-')
@@ -398,11 +419,8 @@ app.get('/api/cameras', async (req, res) => {
             .filter(id => id !== '');
     }
 
-    let metricsByName = {};
-    if (FOAM_METRICS.enabled) {
-        const { metrics } = await getFoamMetrics();
-        metricsByName = metrics;
-    }
+    refreshFoamMetricsInBackground();
+    const metricsByName = FOAM_METRICS.enabled ? getCachedFoamMetrics() : {};
 
     res.json(getCameras(filterIds, metricsByName));
 });
@@ -529,6 +547,10 @@ app.listen(PORT, () => {
     console.log(`Cameras: ${cameras.length}, sections: ${sections.length}`);
     console.log(`Foam metrics: ${FOAM_METRICS.enabled ? 'enabled' : 'disabled'}` +
         (FOAM_METRICS.enabled ? ` (window ${FOAM_METRICS.window_minutes} min, DB ${FOAM_METRICS.database_host})` : ''));
+
+    if (FOAM_METRICS.enabled) {
+        refreshFoamMetricsInBackground();
+    }
 
     if (!chokidar) return;
 

@@ -28,6 +28,7 @@ services:
       - CONFIG_FILE=/app/config.json
       - CAMERA_FOLDER_PREFIX=camera_
       - CHOKIDAR_USEPOLLING=true
+      - FOAM_METRICS_ENABLED=false
     networks:
       - apps
 

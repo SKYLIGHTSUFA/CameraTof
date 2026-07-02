@@ -122,7 +122,10 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
-mapfile -t ALL_IDS < <(load_camera_ids)
+ALL_IDS=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] && ALL_IDS+=("$line")
+done < <(load_camera_ids)
 if [[ ${#ALL_IDS[@]} -eq 0 ]]; then
     echo "Ошибка: в $CONFIG_FILE нет camera_mapping" >&2
     exit 1
