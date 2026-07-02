@@ -279,6 +279,7 @@
             });
         }
 
+        function render(force) {
             const list = camerasForActive();
             const sig = signatureOf(list);
             // Если набор камер не изменился — не пересобираем сетку,
