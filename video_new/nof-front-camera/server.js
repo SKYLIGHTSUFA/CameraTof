@@ -136,6 +136,12 @@ function getMetricsPool() {
     return metricsPool;
 }
 
+/** Округление вниз: decimals=0 → целое, decimals=2 → до сотых. */
+function floorDown(value, decimals = 0) {
+    const factor = 10 ** decimals;
+    return Math.floor(Number(value) * factor) / factor;
+}
+
 async function fetchFoamMetricsFromDb() {
     const pool = getMetricsPool();
     if (!pool) return {};
@@ -146,7 +152,7 @@ async function fetchFoamMetricsFromDb() {
                 MAX(log_datetime) AS last_update
          FROM features
          WHERE log_datetime >= NOW() - ($1::text || ' minutes')::interval
-           AND feature IN ('obj_count', 'obj_area_mean_cm2', 'obj_area_mean')
+           AND feature IN ('obj_count', 'obj_area_mean_cm2', 'obj_equiv_diam_mean_cm')
          GROUP BY cam, feature`,
         [String(windowMin)]
     );
@@ -158,18 +164,26 @@ async function fetchFoamMetricsFromDb() {
             byCamera[shortId] = { updatedAt: null };
         }
         if (row.feature === 'obj_count') {
-            byCamera[shortId].bubbleCount = Math.round(row.avg_value);
+            byCamera[shortId].bubbleCount = floorDown(row.avg_value, 0);
         } else if (row.feature === 'obj_area_mean_cm2') {
             byCamera[shortId].areaCm2 = Number(row.avg_value);
-            byCamera[shortId].areaUnit = 'cm2';
-        } else if (row.feature === 'obj_area_mean' && byCamera[shortId].areaCm2 == null) {
-            byCamera[shortId].areaPx2 = Number(row.avg_value);
-            byCamera[shortId].areaUnit = 'px2';
+        } else if (row.feature === 'obj_equiv_diam_mean_cm') {
+            byCamera[shortId].equivDiamCm = Number(row.avg_value);
         }
         const ts = row.last_update ? new Date(row.last_update).toISOString() : null;
         if (ts && (!byCamera[shortId].updatedAt || ts > byCamera[shortId].updatedAt)) {
             byCamera[shortId].updatedAt = ts;
         }
+    }
+
+    for (const metrics of Object.values(byCamera)) {
+        if (metrics.equivDiamCm > 0) {
+            metrics.sizeCm = floorDown(metrics.equivDiamCm, 2);
+        } else if (metrics.areaCm2 > 0) {
+            metrics.sizeCm = floorDown(Math.sqrt(metrics.areaCm2), 2);
+        }
+        delete metrics.areaCm2;
+        delete metrics.equivDiamCm;
     }
 
     return byCamera;

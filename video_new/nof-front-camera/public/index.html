@@ -255,27 +255,32 @@
                 }));
         }
 
+        function floorDown(value, decimals = 0) {
+            const factor = 10 ** decimals;
+            return Math.floor(Number(value) * factor) / factor;
+        }
+
         function formatMetrics(metrics) {
-            if (!metrics) return { count: '—', area: '—' };
-            const count = metrics.bubbleCount != null ? String(metrics.bubbleCount) : '—';
-            let area = '—';
-            if (metrics.areaCm2 != null) {
-                area = `${metrics.areaCm2.toFixed(2)} см²`;
-            } else if (metrics.areaPx2 != null) {
-                area = `${Math.round(metrics.areaPx2)} px²`;
+            if (!metrics) return { count: '—', size: '—' };
+            const count = metrics.bubbleCount != null
+                ? String(floorDown(metrics.bubbleCount, 0))
+                : '—';
+            let size = '—';
+            if (metrics.sizeCm != null) {
+                size = `${floorDown(metrics.sizeCm, 2).toFixed(2)} см`;
             }
-            return { count, area };
+            return { count, size };
         }
 
         function updateMetricsInGrid() {
             const byId = new Map(allCameras.map(c => [c.id, c]));
             document.querySelectorAll('.camera-cell[data-camera-id]').forEach(cell => {
                 const camera = byId.get(cell.dataset.cameraId);
-                const { count, area } = formatMetrics(camera?.metrics);
+                const { count, size } = formatMetrics(camera?.metrics);
                 const countEl = cell.querySelector('[data-metric="count"]');
-                const areaEl = cell.querySelector('[data-metric="area"]');
+                const sizeEl = cell.querySelector('[data-metric="size"]');
                 if (countEl) countEl.textContent = count;
-                if (areaEl) areaEl.textContent = area;
+                if (sizeEl) sizeEl.textContent = size;
             });
         }
 
@@ -361,20 +366,20 @@
                     countMetric.title = 'Среднее количество пузырей за минуту';
                     countMetric.innerHTML = 'Кол-во пузырей: <span data-metric="count">—</span>';
 
-                    const areaMetric = document.createElement('span');
-                    areaMetric.className = 'metric metric-area';
-                    areaMetric.title = 'Средняя площадь пузырей за минуту';
-                    areaMetric.innerHTML = 'Средняя площадь: <span data-metric="area">—</span>';
+                    const sizeMetric = document.createElement('span');
+                    sizeMetric.className = 'metric metric-size';
+                    sizeMetric.title = 'Средний размер пузырей за минуту (см)';
+                    sizeMetric.innerHTML = 'Средний размер: <span data-metric="size">—</span>';
 
                     metricsRow.appendChild(countMetric);
-                    metricsRow.appendChild(areaMetric);
+                    metricsRow.appendChild(sizeMetric);
 
                     header.appendChild(headerMain);
                     header.appendChild(metricsRow);
 
-                    const { count, area } = formatMetrics(camera.metrics);
+                    const { count, size } = formatMetrics(camera.metrics);
                     countMetric.querySelector('[data-metric="count"]').textContent = count;
-                    areaMetric.querySelector('[data-metric="area"]').textContent = area;
+                    sizeMetric.querySelector('[data-metric="size"]').textContent = size;
 
                     const videoBox = document.createElement('div');
                     videoBox.className = 'video-container';
