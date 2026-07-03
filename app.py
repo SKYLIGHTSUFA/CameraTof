@@ -94,6 +94,10 @@ STREAM_STALE_SEC = float(config.get("stream_stale_sec", 30))
 RECONNECT_ENABLED = config.get("reconnect_enabled", True)
 RECONNECT_RETRY_SEC = float(config.get("reconnect_retry_sec", 120))
 
+# GigE discovery: several passes merged by MAC (id_) to reduce missed cameras
+DISCOVERY_PASSES = int(config.get("discovery_passes", 5))
+DISCOVERY_PASS_DELAY_SEC = float(config.get("discovery_pass_delay_sec", 3.0))
+
 ZMQ_ENABLED = config.get("zmq_enabled", True)
 ZMQ_PORT_BASE = config.get("zmq_port_base", 5555)
 ZMQ_FORMAT = config.get("zmq_format", "raw") # "raw" or "jpeg" (or nvjpeg)
@@ -1055,17 +1059,165 @@ def open_camera_with_retry(h: Harvester, index: int, max_retries: int = MAX_RETR
 # =========================
 # ENUMERATE CAMERAS
 # =========================
-def list_cameras(h: Harvester) -> list:
+def _device_unique_key(di) -> str:
+    id_ = getattr(di, "id_", None)
+    if id_:
+        return str(id_)
+    display_name = getattr(di, "display_name", None)
+    if display_name:
+        return str(display_name)
+    return repr(di)
+
+
+def _device_access_status(di) -> int | None:
+    try:
+        return int(getattr(di, "access_status"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _config_ip_for_camera_id(camera_id: str) -> str:
+    for key, cid in CAMERA_MAPPING.items():
+        if cid != camera_id:
+            continue
+        if "10.228." not in key:
+            return ""
+        start = key.find("(") + 1
+        end = key.find("[")
+        if start > 0 and end > start:
+            return key[start:end]
+    return ""
+
+
+def _cameras_from_device_list(h: Harvester) -> list:
     cameras = []
     for i, di in enumerate(h.device_info_list):
         display_name = di.display_name or f"camera_{i}"
-        camera_id    = get_camera_id(display_name)
         cameras.append({
-            "index":        i,
-            "display_name": display_name,
-            "camera_id":    camera_id,
+            "index":         i,
+            "display_name":  display_name,
+            "camera_id":     get_camera_id(display_name),
+            "access_status": _device_access_status(di),
+            "device_key":    _device_unique_key(di),
         })
     return cameras
+
+
+def discover_cameras(h: Harvester) -> list:
+    merged: dict[str, dict] = {}
+    pass_counts: list[int] = []
+
+    print(
+        f"\n🔍 GigE discovery: {DISCOVERY_PASSES} passes, "
+        f"{DISCOVERY_PASS_DELAY_SEC:.1f}s delay..."
+    )
+    for pass_num in range(1, DISCOVERY_PASSES + 1):
+        h.update()
+        count = len(h.device_info_list)
+        pass_counts.append(count)
+        new_this_pass = 0
+
+        for di in h.device_info_list:
+            key = _device_unique_key(di)
+            access = _device_access_status(di)
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = {
+                    "display_name":  di.display_name or key,
+                    "access_status": access,
+                    "passes_seen":   1,
+                }
+                new_this_pass += 1
+            else:
+                entry["passes_seen"] += 1
+                prev = entry.get("access_status")
+                if access == 1 or prev not in (1, None):
+                    if access == 1 or prev is None:
+                        entry["access_status"] = access
+
+        print(
+            f"   pass {pass_num}/{DISCOVERY_PASSES}: {count} devices, "
+            f"+{new_this_pass} new, merged total={len(merged)}"
+        )
+        if pass_num < DISCOVERY_PASSES:
+            time.sleep(DISCOVERY_PASS_DELAY_SEC)
+
+    cameras_info: list[dict] = []
+    missing_after_final: list[str] = []
+
+    for refresh_attempt in range(2):
+        h.update()
+        index_by_key = {
+            _device_unique_key(di): i for i, di in enumerate(h.device_info_list)
+        }
+        cameras_info = []
+        missing_after_final = []
+
+        for key in sorted(merged.keys(), key=lambda k: merged[k]["display_name"]):
+            info = merged[key]
+            idx = index_by_key.get(key)
+            if idx is None:
+                missing_after_final.append(info["display_name"])
+                continue
+            display_name = info["display_name"]
+            cameras_info.append({
+                "index":         idx,
+                "display_name":  display_name,
+                "camera_id":     get_camera_id(display_name),
+                "access_status": info.get("access_status"),
+                "passes_seen":   info.get("passes_seen", 1),
+                "device_key":    key,
+            })
+
+        if not missing_after_final or refresh_attempt == 1:
+            break
+
+        print(
+            f"⚠️  Final refresh: {len(missing_after_final)} camera(s) missing, "
+            f"retry in {DISCOVERY_PASS_DELAY_SEC:.1f}s..."
+        )
+        time.sleep(DISCOVERY_PASS_DELAY_SEC)
+
+    print(
+        f"📸 Discovery merged: {len(merged)} unique, "
+        f"{len(cameras_info)} ready to open "
+        f"(pass counts: {pass_counts})"
+    )
+
+    if missing_after_final:
+        print(
+            f"⚠️  {len(missing_after_final)} camera(s) seen earlier but missing "
+            f"after final refresh:"
+        )
+        for name in missing_after_final:
+            print(f"      - {name}")
+
+    expected_ids = set(CAMERA_MAPPING.values())
+    found_ids = {cam["camera_id"] for cam in cameras_info}
+    missing_config = sorted(expected_ids - found_ids)
+    if missing_config:
+        print(
+            f"⚠️  {len(missing_config)} camera(s) from config.json not discovered:"
+        )
+        for cid in missing_config:
+            ip_hint = _config_ip_for_camera_id(cid)
+            suffix = f" ({ip_hint})" if ip_hint else ""
+            print(f"      - {cid}{suffix}")
+
+    busy = [cam for cam in cameras_info if cam.get("access_status") == 3]
+    if busy:
+        print(
+            f"⚠️  {len(busy)} camera(s) report access_status=NOACCESS "
+            f"(may fail to open):"
+        )
+        for cam in busy:
+            print(f"      - {cam['camera_id']} {cam['display_name']}")
+
+    return cameras_info
+
+
+def list_cameras(h: Harvester) -> list:
+    return _cameras_from_device_list(h)
 
 
 # =========================
@@ -1122,19 +1274,26 @@ def main():
         print(f"❌ Ошибка загрузки CTI: {e}")
         return
 
-    h.update()
-
-    cameras_info = list_cameras(h)
+    cameras_info = discover_cameras(h)
     camera_count = len(cameras_info)
 
-    print(f"📸 Найдено камер: {camera_count}")
+    print(f"\n📸 Найдено камер: {camera_count}")
     if camera_count == 0:
         print("❌ Камеры не обнаружены.")
         return
 
     print("\n📋 Список камер:")
     for cam in cameras_info:
-        print(f"   [{cam['index']}] {cam['display_name']} -> ID: {cam['camera_id']}")
+        access = cam.get("access_status")
+        access_note = ""
+        if access == 3:
+            access_note = " [NOACCESS]"
+        elif access == 1:
+            access_note = " [OK]"
+        print(
+            f"   [{cam['index']}] {cam['display_name']} -> "
+            f"ID: {cam['camera_id']}{access_note}"
+        )
 
     print("\n🔧 Открытие камер...")
     devices_with_info = []
