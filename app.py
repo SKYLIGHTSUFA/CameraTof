@@ -107,19 +107,120 @@ ZMQ_INFERENCE_FPS = float(config.get("zmq_inference_fps", 0))
 ZMQ_INFERENCE_BURST_PAIRS = bool(config.get("zmq_inference_burst_pairs", False))
 
 # =========================
-# СООТВЕТСТВИЕ DISPLAY_NAME -> ID
+# СООТВЕТСТВИЕ DISPLAY_NAME -> ID + ПАРАМЕТРЫ КАМЕРЫ
 # =========================
 CAMERA_MAPPING = config.get("camera_mapping", {})
 
+# snake_case-ключи camera_mapping, которые обрабатываются отдельно и НЕ передаются
+# в GenICam node map как есть (у них своя логика применения).
+_INTERNAL_CAMERA_CONFIG_KEYS = frozenset({
+    "alias", "camera_id", "genicam", "genicam_extra", "width", "height",
+    "cam_width", "cam_height", "fps_target", "max_camera_fps", "pixel_format",
+    "update_params",
+    "exposure_auto", "exposure_time_us", "auto_exposure_min_us", "auto_exposure_max_us",
+    "gain_auto", "gain", "auto_gain_min", "auto_gain_max",
+    "balance_white_auto", "balance_ratio",
+    "black_level", "gamma", "gamma_enable", "sharpness", "saturation", "digital_shift",
+})
 
-def get_camera_id(display_name, address=None):
+
+def build_global_camera_defaults() -> dict:
+    """Глобальные значения по умолчанию для всех камер (из корня config.json)."""
+    defaults = config.get("camera_defaults", {})
+    merged = {
+        "cam_width": CAM_WIDTH,
+        "cam_height": CAM_HEIGHT,
+        "fps_target": FPS_TARGET,
+        "max_camera_fps": MAX_CAMERA_FPS,
+        "pixel_format": PIXEL_FORMAT_TARGET,
+        "update_params": UPDATE_PARAMS,
+        "exposure_time_us": EXPOSURE_TIME_US,
+    }
+    # Необязательные глобальные характеристики камеры
+    for key in (
+        "exposure_auto", "auto_exposure_min_us", "auto_exposure_max_us",
+        "gain_auto", "gain", "auto_gain_min", "auto_gain_max",
+        "balance_white_auto", "balance_ratio",
+        "black_level", "gamma", "gamma_enable", "sharpness", "saturation", "digital_shift",
+    ):
+        if key in config:
+            merged[key] = config[key]
+    if isinstance(defaults, dict):
+        merged.update(defaults)
+    return merged
+
+
+def _mapping_value_for(display_name: str, address=None):
     if display_name in CAMERA_MAPPING:
         return CAMERA_MAPPING[display_name]
     if address and address in CAMERA_MAPPING:
         return CAMERA_MAPPING[address]
+    return None
+
+
+def get_camera_alias(mapping_value) -> str | None:
+    if isinstance(mapping_value, str):
+        alias = mapping_value.strip()
+        return alias or None
+    if isinstance(mapping_value, dict):
+        alias = mapping_value.get("alias") or mapping_value.get("camera_id")
+        if alias is not None:
+            alias = str(alias).strip()
+            return alias or None
+    return None
+
+
+def resolve_camera_config(mapping_value) -> dict:
+    """Глобальные настройки + переопределения для конкретной камеры."""
+    cfg = build_global_camera_defaults()
+    if not isinstance(mapping_value, dict):
+        return cfg
+    for key, value in mapping_value.items():
+        if key in ("alias", "camera_id"):
+            continue
+        if key == "balance_ratio" and isinstance(value, dict):
+            base_wb = cfg.get("balance_ratio")
+            if isinstance(base_wb, dict):
+                cfg["balance_ratio"] = {**base_wb, **value}
+            else:
+                cfg["balance_ratio"] = dict(value)
+        elif key == "genicam" and isinstance(value, dict):
+            extra = cfg.get("genicam_extra")
+            if not isinstance(extra, dict):
+                extra = {}
+            extra.update(value)
+            cfg["genicam_extra"] = extra
+        else:
+            cfg[key] = value
+    return cfg
+
+
+def get_camera_id(display_name, address=None):
+    alias = get_camera_alias(_mapping_value_for(display_name, address))
+    if alias:
+        return alias
     safe_name = ''.join(c for c in display_name if c.isalnum() or c in '._-')
     print(f"⚠️  Камера '{display_name}' не найдена в CAMERA_MAPPING, используется '{safe_name}'")
     return safe_name
+
+
+def get_camera_config(display_name, address=None) -> dict:
+    return resolve_camera_config(_mapping_value_for(display_name, address))
+
+
+def get_all_expected_camera_ids() -> set:
+    ids: set = set()
+    for value in CAMERA_MAPPING.values():
+        alias = get_camera_alias(value)
+        if alias:
+            ids.add(alias)
+    return ids
+
+
+def effective_fps_for_config(cam_cfg: dict) -> float:
+    fps = float(cam_cfg.get("fps_target", FPS_TARGET))
+    cap = float(cam_cfg.get("max_camera_fps", MAX_CAMERA_FPS))
+    return min(fps, cap) if fps > 0 else 0.0
 
 
 # =========================
@@ -198,70 +299,183 @@ def safe_get_node(nodemap, name: str, default="Unknown"):
     return default
 
 
-def try_set_camera_params(device, camera_name: str) -> bool:
+def _cfg_has_genicam_key(cam_cfg: dict, name: str) -> bool:
+    extra = cam_cfg.get("genicam_extra")
+    return isinstance(extra, dict) and name in extra
+
+
+def _set_and_log(nm, camera_name: str, node: str, value) -> bool:
+    ok = safe_set_node(nm, node, value)
+    if ok:
+        print(f"[CAM {camera_name}] {node} = {value}")
+    else:
+        print(f"[CAM {camera_name}] ⚠️ узел {node} недоступен/не принял {value}")
+    return ok
+
+
+def _set_exposure(nm, camera_name: str, cfg: dict) -> None:
+    mode = cfg.get("exposure_auto", "Off")
+    _set_and_log(nm, camera_name, "ExposureAuto", mode)
+    if str(mode) != "Off":
+        if "auto_exposure_min_us" in cfg:
+            safe_set_node(nm, "AutoExposureTimeMin", float(cfg["auto_exposure_min_us"]))
+        if "auto_exposure_max_us" in cfg:
+            safe_set_node(nm, "AutoExposureTimeMax", float(cfg["auto_exposure_max_us"]))
+        return
+    exposure_us = float(cfg.get("exposure_time_us", EXPOSURE_TIME_US))
     try:
+        if hasattr(nm, "ExposureTime"):
+            nm.ExposureTime.value = exposure_us
+        elif hasattr(nm, "ExposureTimeAbs"):
+            nm.ExposureTimeAbs.value = exposure_us
+        elif hasattr(nm, "ExposureTimeRaw"):
+            nm.ExposureTimeRaw.value = int(exposure_us)
+        print(f"[CAM {camera_name}] ExposureTime = {exposure_us} us")
+    except Exception as e:
+        print(f"[CAM {camera_name}] не удалось установить экспозицию: {e}")
+
+
+def _set_gain(nm, camera_name: str, cfg: dict) -> None:
+    mode = cfg.get("gain_auto", "Off")
+    _set_and_log(nm, camera_name, "GainAuto", mode)
+    if str(mode) != "Off":
+        if "auto_gain_min" in cfg:
+            safe_set_node(nm, "AutoGainMin", float(cfg["auto_gain_min"]))
+        if "auto_gain_max" in cfg:
+            safe_set_node(nm, "AutoGainMax", float(cfg["auto_gain_max"]))
+        return
+    if "gain" not in cfg:
+        return
+    gain_value = float(cfg["gain"])
+    try:
+        if hasattr(nm, "Gain"):
+            nm.Gain.value = gain_value
+        elif hasattr(nm, "GainRaw"):
+            nm.GainRaw.value = int(gain_value * 10)
+        print(f"[CAM {camera_name}] Gain = {gain_value} dB")
+    except Exception as e:
+        print(f"[CAM {camera_name}] не удалось установить Gain: {e}")
+
+
+def _set_white_balance(nm, camera_name: str, cfg: dict) -> None:
+    """Баланс белого на камере (color-модели). Убирает синий/цветной оттенок."""
+    mode = cfg.get("balance_white_auto")
+    ratios = cfg.get("balance_ratio")
+
+    if mode is not None:
+        _set_and_log(nm, camera_name, "BalanceWhiteAuto", mode)
+
+    # Ручные коэффициенты применимы только когда авто выключен
+    if isinstance(ratios, dict) and ratios:
+        if mode is None:
+            _set_and_log(nm, camera_name, "BalanceWhiteAuto", "Off")
+        elif str(mode) != "Off":
+            print(
+                f"[CAM {camera_name}] ⚠️ balance_ratio игнорируется, "
+                f"т.к. balance_white_auto={mode}"
+            )
+            return
+        for channel in ("Red", "Green", "Blue"):
+            if channel not in ratios:
+                continue
+            if not safe_set_node(nm, "BalanceRatioSelector", channel):
+                print(f"[CAM {camera_name}] ⚠️ BalanceRatioSelector недоступен")
+                break
+            val = float(ratios[channel])
+            if safe_set_node(nm, "BalanceRatio", val):
+                print(f"[CAM {camera_name}] BalanceRatio[{channel}] = {val}")
+            else:
+                print(f"[CAM {camera_name}] ⚠️ BalanceRatio[{channel}] не принят")
+
+
+def _set_image_quality(nm, camera_name: str, cfg: dict) -> None:
+    """Гамма, black level, резкость, насыщенность, digital shift — на самой камере."""
+    if "gamma_enable" in cfg:
+        _set_and_log(nm, camera_name, "GammaEnable", bool(cfg["gamma_enable"]))
+    if "gamma" in cfg:
+        if "gamma_enable" not in cfg:
+            safe_set_node(nm, "GammaEnable", True)
+        _set_and_log(nm, camera_name, "Gamma", float(cfg["gamma"]))
+    if "black_level" in cfg:
+        _set_and_log(nm, camera_name, "BlackLevel", float(cfg["black_level"]))
+    if "sharpness" in cfg:
+        _set_and_log(nm, camera_name, "Sharpness", cfg["sharpness"])
+    if "saturation" in cfg:
+        _set_and_log(nm, camera_name, "Saturation", cfg["saturation"])
+    if "digital_shift" in cfg:
+        _set_and_log(nm, camera_name, "DigitalShift", int(cfg["digital_shift"]))
+
+
+def _apply_genicam_extra(nm, cam_cfg: dict, camera_name: str) -> None:
+    """Произвольные GenICam-узлы из блока genicam{} (сырой passthrough)."""
+    extra = cam_cfg.get("genicam_extra")
+    if not isinstance(extra, dict):
+        return
+    for name, value in extra.items():
+        _set_and_log(nm, camera_name, str(name), value)
+
+
+def try_set_camera_params(device, camera_name: str, cam_cfg: dict | None = None) -> bool:
+    try:
+        cfg = cam_cfg or build_global_camera_defaults()
         nm = device.remote_device.node_map
         if nm is None:
             print(f"[CAM {camera_name}] NodeMap unavailable")
             return False
 
-        if UPDATE_PARAMS:
-            safe_set_node(nm, "TriggerMode", "Off")
-            safe_set_node(nm, "ExposureAuto", "Off")
-            safe_set_node(nm, "GainAuto", "Off")
-            fps_mode_ok = safe_set_node(nm, "AcquisitionFrameRateMode", "On")
-            fps_enable_ok = safe_set_node(nm, "AcquisitionFrameRateEnable", True)
-            fps_ok = safe_set_node(nm, "AcquisitionFrameRate", EFFECTIVE_FPS_TARGET)
-            real_fps = safe_get_node(nm, "AcquisitionFrameRate")
-            fps_mode = safe_get_node(nm, "AcquisitionFrameRateMode")
-            fps_enable = safe_get_node(nm, "AcquisitionFrameRateEnable")
-            print(
-                f"[CAM {camera_name}] AcquisitionFrameRate target={EFFECTIVE_FPS_TARGET} "
-                f"(config={FPS_TARGET}, max={MAX_CAMERA_FPS}), "
-                f"actual={real_fps}, mode={fps_mode}, enable={fps_enable}, "
-                f"set_ok={fps_ok}, mode_ok={fps_mode_ok}, enable_ok={fps_enable_ok}"
-            )
+        update_params = bool(cfg.get("update_params", UPDATE_PARAMS))
+        cam_width = int(cfg.get("cam_width", CAM_WIDTH))
+        cam_height = int(cfg.get("cam_height", CAM_HEIGHT))
+        pixel_format = cfg.get("pixel_format", PIXEL_FORMAT_TARGET)
+        target_fps = effective_fps_for_config(cfg)
+
+        if update_params:
+            if not _cfg_has_genicam_key(cfg, "TriggerMode"):
+                safe_set_node(nm, "TriggerMode", "Off")
+
+            if not _cfg_has_genicam_key(cfg, "AcquisitionFrameRate"):
+                fps_mode_ok = safe_set_node(nm, "AcquisitionFrameRateMode", "On")
+                fps_enable_ok = safe_set_node(nm, "AcquisitionFrameRateEnable", True)
+                fps_ok = safe_set_node(nm, "AcquisitionFrameRate", target_fps)
+                real_fps = safe_get_node(nm, "AcquisitionFrameRate")
+                fps_mode = safe_get_node(nm, "AcquisitionFrameRateMode")
+                fps_enable = safe_get_node(nm, "AcquisitionFrameRateEnable")
+                print(
+                    f"[CAM {camera_name}] AcquisitionFrameRate target={target_fps} "
+                    f"(config={cfg.get('fps_target', FPS_TARGET)}, "
+                    f"max={cfg.get('max_camera_fps', MAX_CAMERA_FPS)}), "
+                    f"actual={real_fps}, mode={fps_mode}, enable={fps_enable}, "
+                    f"set_ok={fps_ok}, mode_ok={fps_mode_ok}, enable_ok={fps_enable_ok}"
+                )
 
             # ROI
             try:
-                nm.Width.value  = CAM_WIDTH
-                nm.Height.value = CAM_HEIGHT
+                nm.Width.value = cam_width
+                nm.Height.value = cam_height
                 nm.OffsetX.value = 0
                 nm.OffsetY.value = 0
-                print(f"[CAM {camera_name}] Region = {CAM_WIDTH}x{CAM_HEIGHT}")
+                print(f"[CAM {camera_name}] Region = {cam_width}x{cam_height}")
             except Exception as e:
                 print(f"[CAM {camera_name}] не удалось установить ROI: {e}")
 
             # Pixel format
             try:
-                nm.PixelFormat.value = PIXEL_FORMAT_TARGET
-                print(f"[CAM {camera_name}] PixelFormat = {PIXEL_FORMAT_TARGET}")
+                nm.PixelFormat.value = pixel_format
+                print(f"[CAM {camera_name}] PixelFormat = {pixel_format}")
             except Exception as e:
-                print(f"[CAM {camera_name}] PixelFormat ({PIXEL_FORMAT_TARGET}) не удалось: {e}")
+                print(f"[CAM {camera_name}] PixelFormat ({pixel_format}) не удалось: {e}")
 
-            # Exposure
-            try:
-                if hasattr(nm, "ExposureTime"):
-                    nm.ExposureTime.value = float(EXPOSURE_TIME_US)
-                elif hasattr(nm, "ExposureTimeAbs"):
-                    nm.ExposureTimeAbs.value = float(EXPOSURE_TIME_US)
-                elif hasattr(nm, "ExposureTimeRaw"):
-                    nm.ExposureTimeRaw.value = int(EXPOSURE_TIME_US)
-                print(f"[CAM {camera_name}] ExposureTime = {EXPOSURE_TIME_US} us")
-            except Exception as e:
-                print(f"[CAM {camera_name}] не удалось установить экспозицию: {e}")
+            # Характеристики изображения на самой камере
+            _set_exposure(nm, camera_name, cfg)
+            _set_gain(nm, camera_name, cfg)
+            _set_white_balance(nm, camera_name, cfg)
+            _set_image_quality(nm, camera_name, cfg)
 
-            # Gain
-            try:
-                if hasattr(nm, "Gain"):
-                    nm.Gain.value = 15.0
-                elif hasattr(nm, "GainRaw"):
-                    nm.GainRaw.value = 150
-                print(f"[CAM {camera_name}] Gain = 15.0")
-            except Exception as e:
-                print(f"[CAM {camera_name}] не удалось установить Gain: {e}")
+            if not _cfg_has_genicam_key(cfg, "GevSCPSPacketSize"):
+                safe_set_node(nm, "GevSCPSPacketSize", 8000)
 
-            safe_set_node(nm, "GevSCPSPacketSize", 8000)
+            # Произвольные узлы из genicam{} — применяются последними и перекрывают всё
+            _apply_genicam_extra(nm, cfg, camera_name)
         else:
             print(f"[CAM {camera_name}] ⏩ Обновление параметров пропущено (update_params=false)")
 
@@ -270,14 +484,15 @@ def try_set_camera_params(device, camera_name: str) -> bool:
         except Exception: real_fmt = "Unknown"
         try:    exp_value = nm.ExposureTime.value
         except Exception: exp_value = "Unknown"
-        try:    gain_value = nm.Gain.value
-        except Exception: gain_value = "Unknown"
+        try:    gain_actual = nm.Gain.value
+        except Exception: gain_actual = "Unknown"
         try:    w = nm.Width.value; h = nm.Height.value
         except Exception: w = h = "?"
+        wb_actual = safe_get_node(nm, "BalanceWhiteAuto", "n/a")
 
         print(
             f"[CAM {camera_name}] ⚙️ PixFmt={real_fmt}, ROI={w}x{h}, "
-            f"Exp={exp_value}us, Gain={gain_value}dB"
+            f"Exp={exp_value}us, Gain={gain_actual}dB, WB={wb_actual}"
         )
         return True
 
@@ -529,6 +744,7 @@ class CameraWorker:
         zmq_ctx: zmq.Context | None = None,
         harvester: Harvester | None = None,
         device_index: int = -1,
+        cam_cfg: dict | None = None,
     ):
         self.device       = device      # harvesters ImageAcquirer
         self.camera_id    = camera_id
@@ -543,6 +759,7 @@ class CameraWorker:
         self._stale_lock = threading.Lock()
         self._acquisition_start_time = 0.0
         self._last_stale_action = 0.0
+        self.cam_cfg = cam_cfg or build_global_camera_defaults()
 
         # Setup ZMQ interface for low latency inference (connecting to inproc proxy)
         if self.zmq_ctx is not None:
@@ -566,7 +783,11 @@ class CameraWorker:
         self._drop_count = 0
         self._last_drop_log = time.time()
 
-        self.frame_interval = 1.0 / EFFECTIVE_FPS_TARGET if EFFECTIVE_FPS_TARGET > 0 else 0.0
+        self.frame_interval = (
+            1.0 / effective_fps_for_config(self.cam_cfg)
+            if effective_fps_for_config(self.cam_cfg) > 0
+            else 0.0
+        )
         self.last_frame_time = 0.0
 
         self.pixel_format = "Unknown"
@@ -703,7 +924,8 @@ class CameraWorker:
 
     def _setup_device(self) -> bool:
         try:
-            try_set_camera_params(self.device, f"{self.display_name} ({self.camera_id})")
+            label = f"{self.display_name} ({self.camera_id})"
+            try_set_camera_params(self.device, label, self.cam_cfg)
 
             try:
                 self.pixel_format = self.device.remote_device.node_map.PixelFormat.value
@@ -1077,8 +1299,8 @@ def _device_access_status(di) -> int | None:
 
 
 def _config_ip_for_camera_id(camera_id: str) -> str:
-    for key, cid in CAMERA_MAPPING.items():
-        if cid != camera_id:
+    for key, value in CAMERA_MAPPING.items():
+        if get_camera_alias(value) != camera_id:
             continue
         if "10.228." not in key:
             return ""
@@ -1192,7 +1414,7 @@ def discover_cameras(h: Harvester) -> list:
         for name in missing_after_final:
             print(f"      - {name}")
 
-    expected_ids = set(CAMERA_MAPPING.values())
+    expected_ids = get_all_expected_camera_ids()
     found_ids = {cam["camera_id"] for cam in cameras_info}
     missing_config = sorted(expected_ids - found_ids)
     if missing_config:
@@ -1333,6 +1555,8 @@ def main():
     for i, info in enumerate(devices_with_info):
         gpu_id = gpu_ids[i % len(gpu_ids)]
 
+        cam_cfg = get_camera_config(info["display_name"])
+
         w = CameraWorker(
             info["device"],
             info["camera_id"],
@@ -1342,6 +1566,7 @@ def main():
             zmq_ctx=zmq_ctx,
             harvester=h,
             device_index=info["index"],
+            cam_cfg=cam_cfg,
         )
         workers.append(w)
 

@@ -59,6 +59,10 @@ ids = []
 for value in mapping.values():
     if isinstance(value, str) and value.strip():
         ids.append(value.strip())
+    elif isinstance(value, dict):
+        alias = value.get("alias") or value.get("camera_id")
+        if alias and str(alias).strip():
+            ids.append(str(alias).strip())
 print("\n".join(ids))
 PY
 }

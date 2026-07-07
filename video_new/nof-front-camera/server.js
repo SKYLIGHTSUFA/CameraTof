@@ -306,7 +306,13 @@ function loadExpectedCameraIds() {
         const mapping = config.camera_mapping || {};
         const ids = new Set();
 
-        for (const cameraId of Object.values(mapping)) {
+        for (const value of Object.values(mapping)) {
+            let cameraId = null;
+            if (typeof value === 'string') {
+                cameraId = value;
+            } else if (value && typeof value === 'object' && value.alias) {
+                cameraId = value.alias;
+            }
             if (typeof cameraId !== 'string') continue;
             const trimmed = cameraId.trim();
             if (!trimmed) continue;
