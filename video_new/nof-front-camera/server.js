@@ -270,6 +270,17 @@ function sanitizeUser(user) {
     };
 }
 
+function createId() {
+    if (typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    const bytes = crypto.randomBytes(16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = bytes.toString('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function hashPassword(password) {
     const salt = crypto.randomBytes(16).toString('hex');
     const hash = crypto.scryptSync(password, salt, 64).toString('hex');
@@ -290,7 +301,7 @@ function loadUsers() {
         const username = process.env.AUTH_ADMIN_USER || 'admin';
         const password = process.env.AUTH_ADMIN_PASSWORD || 'admin';
         const admin = {
-            id: crypto.randomUUID(),
+            id: createId(),
             username,
             passwordHash: hashPassword(password),
             role: 'admin',
@@ -606,7 +617,7 @@ app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
     }
 
     const user = {
-        id: crypto.randomUUID(),
+        id: createId(),
         username: cleanUsername,
         passwordHash: hashPassword(password),
         role: cleanRole,
@@ -675,7 +686,7 @@ app.post('/api/configs', (req, res) => {
     }
 
     const config = {
-        id: crypto.randomUUID(),
+        id: createId(),
         name: name.trim().slice(0, 60),
         builtin: false,
         cameras: cameras.filter(c => typeof c === 'string' && c.trim() !== '')
