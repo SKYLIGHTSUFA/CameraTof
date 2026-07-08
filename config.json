@@ -1,4 +1,6 @@
 {
+  "camera_source": "rtsp", // "gige",
+  "rtsp_transport": "tcp",
   "cti_file_path": "/opt/galaxy_sdk/lib/x86_64/GxGVTL.cti",
   "base_output_dir": "hls_output",
   "width": 480,
@@ -46,6 +48,31 @@
   "zmq_format": "raw",
   "zmq_inference_fps": 2,
   "zmq_inference_burst_pairs": true,
+  "rtsp_cameras": [
+    { "id": "2-3", "rtsp_url": "rtsp://10.133.24.3/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-4", "rtsp_url": "rtsp://10.133.24.9/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-5", "rtsp_url": "rtsp://10.133.24.7/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-6", "rtsp_url": "rtsp://10.133.24.10/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-7", "rtsp_url": "rtsp://10.133.24.13/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-8", "rtsp_url": "rtsp://10.133.24.12/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-9", "rtsp_url": "rtsp://10.133.24.8/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-10", "rtsp_url": "rtsp://10.133.24.15/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-11", "rtsp_url": "rtsp://10.133.24.14/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-13", "rtsp_url": "rtsp://10.133.24.4/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-14", "rtsp_url": "rtsp://10.133.24.5/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-15", "rtsp_url": "rtsp://10.133.24.2/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-16", "rtsp_url": "rtsp://10.133.24.6/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "2-19", "rtsp_url": "rtsp://10.133.24.11/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-5", "rtsp_url": "rtsp://10.133.24.21/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 20 },
+    { "id": "4-8", "rtsp_url": "rtsp://10.133.24.22/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-4", "rtsp_url": "rtsp://10.133.24.23/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-7", "rtsp_url": "rtsp://10.133.24.24/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-6", "rtsp_url": "rtsp://10.133.24.25/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-3", "rtsp_url": "rtsp://10.133.24.26/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-1", "rtsp_url": "rtsp://10.133.24.27/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-9", "rtsp_url": "rtsp://10.133.24.28/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 },
+    { "id": "4-10", "rtsp_url": "rtsp://10.133.24.29/", "fps": 20, "fps_target": 5, "max_reconnect_attempts": 10, "max_backoff_seconds": 10 }
+  ],
   "camera_mapping": {
     "MER2-231-41GC-P(10.228.0.31[00-21-49-08-05-E1])": {
       "alias": "90.1.1",

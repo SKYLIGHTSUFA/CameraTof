@@ -16,10 +16,6 @@ import numpy as np
 from harvesters.core import Harvester
 import genicam.gentl as gentl
 
-print("=" * 70)
-print("ЗАПУСК СИСТЕМЫ ЗАХВАТА ВИДЕО С КАМЕР (HARVESTERS + GALAXY SDK)")
-print("=" * 70)
-
 # OpenCV с CUDA (опционально)
 try:
     import cv2  # type: ignore
@@ -50,6 +46,20 @@ def load_config(path: str) -> dict:
         return {}
 
 config = load_config(CONFIG_FILE)
+
+CAMERA_SOURCE = str(config.get("camera_source", "gige")).strip().lower()
+RTSP_CAMERAS: list = config.get("rtsp_cameras", [])
+RTSP_TRANSPORT = str(config.get("rtsp_transport", "tcp")).strip().lower()
+
+if CAMERA_SOURCE == "rtsp":
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{RTSP_TRANSPORT}"
+
+print("=" * 70)
+if CAMERA_SOURCE == "rtsp":
+    print("ЗАПУСК СИСТЕМЫ ЗАХВАТА ВИДЕО С RTSP-КАМЕР")
+else:
+    print("ЗАПУСК СИСТЕМЫ ЗАХВАТА ВИДЕО С КАМЕР (HARVESTERS + GALAXY SDK)")
+print("=" * 70)
 
 BASE_OUTPUT_DIR = config.get("base_output_dir", "hls_output")
 
@@ -215,6 +225,31 @@ def get_all_expected_camera_ids() -> set:
         if alias:
             ids.add(alias)
     return ids
+
+
+def get_all_rtsp_camera_ids() -> set:
+    ids: set = set()
+    for entry in RTSP_CAMERAS:
+        if not isinstance(entry, dict):
+            continue
+        cam_id = entry.get("id") or entry.get("alias")
+        if cam_id is not None:
+            cam_id = str(cam_id).strip()
+            if cam_id:
+                ids.add(cam_id)
+    return ids
+
+
+def resolve_rtsp_camera_config(cam_entry: dict) -> dict:
+    """Глобальные настройки + переопределения для конкретной RTSP-камеры."""
+    cfg = build_global_camera_defaults()
+    if not isinstance(cam_entry, dict):
+        return cfg
+    for key, value in cam_entry.items():
+        if key in ("id", "alias", "rtsp_url"):
+            continue
+        cfg[key] = value
+    return cfg
 
 
 def effective_fps_for_config(cam_cfg: dict) -> float:
@@ -1246,6 +1281,311 @@ class CameraWorker:
 
 
 # =========================
+# RTSP CAMERA WORKER
+# =========================
+class RtspCameraWorker:
+    def __init__(
+        self,
+        camera_id: str,
+        rtsp_url: str,
+        use_nvenc: bool,
+        gpu_id: int = 0,
+        cam_cfg: dict | None = None,
+        max_reconnect_attempts: int = 10,
+        max_backoff_seconds: int = 300,
+        zmq_ctx: zmq.Context | None = None,
+    ):
+        self.camera_id = camera_id
+        self.rtsp_url = rtsp_url
+        self.display_name = rtsp_url
+        self.gpu_id = gpu_id
+        self.running = True
+        self.cam_cfg = cam_cfg or build_global_camera_defaults()
+        self.max_reconnect_attempts = max(1, int(max_reconnect_attempts))
+        self.max_backoff_seconds = max(1, int(max_backoff_seconds))
+        self._reconnect_count = 0
+
+        self.zmq_ctx = zmq_ctx
+        self.zmq_socket = None
+        if self.zmq_ctx is not None:
+            try:
+                self.zmq_socket = self.zmq_ctx.socket(zmq.PUB)
+                self.zmq_socket.setsockopt(zmq.SNDHWM, 2)
+                self.zmq_socket.connect("inproc://zmq_workers")
+            except Exception as e:
+                print(f"[CAM {self.camera_id}] ⚠️ ZMQ init failed: {e}")
+                self.zmq_socket = None
+
+        self.q = queue.Queue(maxsize=2)
+        self.hls = HLSStreamer(camera_id, self.display_name, use_nvenc, gpu_id)
+        self._capture: object | None = None
+        self._capture_lock = threading.Lock()
+        self._stale_lock = threading.Lock()
+        self._last_stale_action = 0.0
+        self._stream_start_time = 0.0
+
+        self.fps_count = 0
+        self.last_fps = time.time()
+        self.last_empty_log = 0
+        self.fetch_count = 0
+        self.last_fetch_log = time.time()
+        self._drop_count = 0
+        self.last_frame_time = 0.0
+
+        eff_fps = effective_fps_for_config(self.cam_cfg)
+        self.frame_interval = 1.0 / eff_fps if eff_fps > 0 else 0.0
+        self.pixel_format = "BGR8"
+
+        self._zmq_prev_capture = None
+        self._zmq_last_publish = 0.0
+
+    def _send_zmq_frame(self, frame: np.ndarray, now: float) -> bool:
+        if self.zmq_socket is None:
+            return False
+        try:
+            if ZMQ_FORMAT in ("jpeg", "nvjpeg"):
+                ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ret:
+                    return False
+                msg_bytes = encoded.tobytes()
+                meta = {
+                    "camera_id": self.camera_id,
+                    "display_name": self.display_name,
+                    "timestamp": now,
+                    "format": "jpeg",
+                    "pixel_format": self.pixel_format,
+                }
+            else:
+                msg_bytes = frame.data if frame.flags["C_CONTIGUOUS"] else np.ascontiguousarray(frame).data
+                meta = {
+                    "camera_id": self.camera_id,
+                    "display_name": self.display_name,
+                    "timestamp": now,
+                    "format": "raw",
+                    "shape": frame.shape,
+                    "dtype": str(frame.dtype),
+                    "pixel_format": self.pixel_format,
+                }
+            topic = f"cam_{self.camera_id}".encode('ascii')
+            self.zmq_socket.send(topic, zmq.SNDMORE)
+            self.zmq_socket.send_json(meta, zmq.SNDMORE)
+            self.zmq_socket.send(msg_bytes, copy=False)
+            return True
+        except Exception as e:
+            if self.fetch_count == 0:
+                print(f"[CAM {self.camera_id}] ZMQ Send error: {e}")
+            return False
+
+    def _maybe_publish_zmq(self, frame: np.ndarray, now: float):
+        if self.zmq_socket is None:
+            return
+        if ZMQ_INFERENCE_FPS <= 0:
+            self._send_zmq_frame(frame, now)
+            return
+        if ZMQ_INFERENCE_BURST_PAIRS:
+            burst_interval = 2.0 / ZMQ_INFERENCE_FPS
+            prev = self._zmq_prev_capture
+            self._zmq_prev_capture = frame.copy()
+            if prev is None:
+                return
+            if now - self._zmq_last_publish < burst_interval:
+                return
+            self._zmq_last_publish = now
+            self._send_zmq_frame(prev, now)
+            self._send_zmq_frame(frame, now)
+            return
+        min_interval = 1.0 / ZMQ_INFERENCE_FPS
+        if now - self._zmq_last_publish < min_interval:
+            return
+        self._zmq_last_publish = now
+        self._send_zmq_frame(frame, now)
+
+    def _release_capture(self):
+        with self._capture_lock:
+            if self._capture is not None:
+                try:
+                    self._capture.release()
+                except Exception:
+                    pass
+                self._capture = None
+
+    def _connect(self) -> bool:
+        if cv2 is None:
+            print(f"[CAM {self.camera_id}] ❌ OpenCV не установлен — RTSP недоступен")
+            return False
+        self._release_capture()
+        try:
+            cap = cv2.VideoCapture(self.rtsp_url)
+            if not cap.isOpened():
+                return False
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            with self._capture_lock:
+                self._capture = cap
+            self._reconnect_count = 0
+            self._stream_start_time = time.time()
+            print(f"[CAM {self.camera_id}] ✅ RTSP подключён: {self.rtsp_url}")
+            return True
+        except Exception as e:
+            print(f"[CAM {self.camera_id}] ❌ RTSP connect error: {e}")
+            self._release_capture()
+            return False
+
+    def _reconnect(self) -> bool:
+        self._reconnect_count += 1
+        base_delay = min(2 ** self._reconnect_count, self.max_backoff_seconds)
+        delay = min(base_delay, self.max_backoff_seconds)
+        print(
+            f"[CAM {self.camera_id}] 🔄 переподключение RTSP "
+            f"(попытка {self._reconnect_count}/{self.max_reconnect_attempts}) через {delay:.1f}s..."
+        )
+        time.sleep(delay)
+        if self._reconnect_count > self.max_reconnect_attempts:
+            print(f"[CAM {self.camera_id}] ❌ лимит попыток RTSP переподключения")
+            return False
+        return self._connect()
+
+    def _read_frame(self) -> np.ndarray | None:
+        with self._capture_lock:
+            cap = self._capture
+        if cap is None or not cap.isOpened():
+            return None
+        try:
+            if not cap.grab():
+                return None
+            retrieved, frame = cap.retrieve()
+            if not retrieved or frame is None or frame.size == 0:
+                return None
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            return frame
+        except Exception as e:
+            if self.fetch_count < 3:
+                print(f"[CAM {self.camera_id}] ⚠️ read error: {e}")
+            return None
+
+    def _check_stream_stale(self, now: float):
+        if not RECONNECT_ENABLED or STREAM_STALE_SEC <= 0:
+            return
+        if not self._stale_lock.acquire(blocking=False):
+            return
+        try:
+            if self.last_frame_time > 0:
+                ref_time = self.last_frame_time
+            elif self._stream_start_time > 0:
+                ref_time = self._stream_start_time
+            else:
+                return
+            stale_for = now - ref_time
+            if stale_for < STREAM_STALE_SEC:
+                return
+            if now - self._last_stale_action < RECONNECT_RETRY_SEC:
+                return
+            self._last_stale_action = now
+            print(
+                f"[CAM {self.camera_id}] ⚠️ RTSP поток устарел "
+                f"({stale_for:.0f}s без кадров) — очистка HLS и переподключение..."
+            )
+            self.hls.stop()
+            self.hls.purge_files()
+            while True:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    break
+            self._release_capture()
+            if self._reconnect():
+                self.last_frame_time = 0.0
+                self._stream_start_time = time.time()
+            else:
+                print(
+                    f"[CAM {self.camera_id}] ❌ RTSP переподключение не удалось, "
+                    f"повтор через {RECONNECT_RETRY_SEC:.0f}s"
+                )
+        finally:
+            self._stale_lock.release()
+
+    def capture(self):
+        print(f"[CAM {self.camera_id}] 📷 START RTSP capture ({self.rtsp_url})")
+        if not self._connect():
+            self.running = False
+            return
+
+        while self.running:
+            self._check_stream_stale(time.time())
+            frame = self._read_frame()
+            if frame is None:
+                self._release_capture()
+                if not self.running:
+                    break
+                if not self._reconnect():
+                    time.sleep(RECONNECT_RETRY_SEC)
+                continue
+
+            height, width = frame.shape[:2]
+            now = time.time()
+            if self.frame_interval > 0 and now - self.last_frame_time < self.frame_interval:
+                continue
+
+            if not self.hls.running:
+                self.hls.start("bgr24", width, height)
+
+            self._maybe_publish_zmq(frame, now)
+
+            while True:
+                try:
+                    self.q.put_nowait(frame)
+                    break
+                except queue.Full:
+                    try:
+                        self.q.get_nowait()
+                        self._drop_count += 1
+                    except queue.Empty:
+                        break
+
+            self.last_frame_time = now
+            self.fetch_count += 1
+
+            now = time.time()
+            if now - self.last_fetch_log >= 5.0:
+                print(
+                    f"[CAM {self.camera_id}] 🔍 RTSP capture FPS: "
+                    f"{self.fetch_count / 5.0:.1f}, drops={self._drop_count}"
+                )
+                self.fetch_count = 0
+                self._drop_count = 0
+                self.last_fetch_log = now
+
+    def encode(self):
+        print(f"[CAM {self.camera_id}] 🎞 START RTSP encode")
+        while self.running:
+            try:
+                frame = self.q.get(timeout=1.0)
+                self.hls.send(frame)
+                self.fps_count += 1
+                now = time.time()
+                if now - self.last_fps >= 5.0:
+                    print(f"[CAM {self.camera_id}] HLS FPS={self.fps_count / 5.0:.1f}")
+                    self.fps_count = 0
+                    self.last_fps = now
+            except queue.Empty:
+                now = time.time()
+                self._check_stream_stale(now)
+                if now - self.last_empty_log > 5.0:
+                    print(f"[CAM {self.camera_id}] ⏳ нет кадров RTSP...")
+                    self.last_empty_log = now
+
+    def stop(self):
+        self.running = False
+        self.hls.stop()
+        self._release_capture()
+        print(f"[CAM {self.camera_id}] Stopped")
+
+
+# =========================
 # ОТКРЫТИЕ КАМЕРЫ С ПОВТОРНЫМИ ПОПЫТКАМИ
 # =========================
 def open_camera_with_retry(h: Harvester, index: int, max_retries: int = MAX_RETRIES):
@@ -1443,9 +1783,129 @@ def list_cameras(h: Harvester) -> list:
 
 
 # =========================
-# MAIN
+# MAIN (RTSP)
 # =========================
-def main():
+def main_rtsp():
+    def _shutdown_handler(signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    if cv2 is None:
+        print("❌ OpenCV не установлен — RTSP режим недоступен")
+        return
+
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        print("✅ FFmpeg найден")
+    except Exception:
+        print("❌ FFmpeg не найден")
+        return
+
+    use_nvenc = USE_NVENC and check_nvenc_available()
+
+    gpu_ids: list = []
+    if use_nvenc:
+        if GPU_DEVICE_IDS is None:
+            print("\n🔍 Автоопределение GPU...")
+            gpu_ids = detect_nvidia_gpus()
+            if not gpu_ids:
+                print("⚠️  GPU не обнаружены, откатываемся на libx264 (CPU)")
+                use_nvenc = False
+            else:
+                print(f"✅ Найдено GPU: {len(gpu_ids)} → {gpu_ids}")
+        else:
+            gpu_ids = list(GPU_DEVICE_IDS)
+            print(f"✅ Заданы GPU вручную: {gpu_ids}")
+
+    if not gpu_ids:
+        gpu_ids = [0]
+
+    cameras = [c for c in RTSP_CAMERAS if isinstance(c, dict) and c.get("rtsp_url")]
+    if not cameras:
+        print("❌ В config.json нет rtsp_cameras (или пустой список)")
+        return
+
+    print(f"\n📸 RTSP камер в конфиге: {len(cameras)}")
+    for cam in cameras:
+        cam_id = str(cam.get("id") or cam.get("alias") or "?")
+        print(f"   • {cam_id} -> {cam['rtsp_url']}")
+
+    zmq_ctx = None
+    if ZMQ_ENABLED:
+        try:
+            zmq_ctx = zmq.Context()
+            xpub = zmq_ctx.socket(zmq.XPUB)
+            xpub.bind(f"tcp://0.0.0.0:{ZMQ_PORT_BASE}")
+            xsub = zmq_ctx.socket(zmq.XSUB)
+            xsub.bind("inproc://zmq_workers")
+            threading.Thread(
+                target=zmq.proxy, args=(xsub, xpub), daemon=True, name="ZMQ_Proxy"
+            ).start()
+            print(f"\n🚀 ZMQ XPUB bound on port {ZMQ_PORT_BASE}")
+        except Exception as e:
+            print(f"\n⚠️ ZMQ Proxy init failed: {e}")
+            zmq_ctx = None
+
+    print("\n🚀 Запуск RTSP потоков...")
+    workers = []
+    for i, cam in enumerate(cameras):
+        cam_id = str(cam.get("id") or cam.get("alias") or f"rtsp_{i}")
+        gpu_id = gpu_ids[i % len(gpu_ids)]
+        cam_cfg = resolve_rtsp_camera_config(cam)
+        w = RtspCameraWorker(
+            camera_id=cam_id,
+            rtsp_url=str(cam["rtsp_url"]),
+            use_nvenc=use_nvenc,
+            gpu_id=gpu_id,
+            cam_cfg=cam_cfg,
+            max_reconnect_attempts=int(cam.get("max_reconnect_attempts", 10)),
+            max_backoff_seconds=int(cam.get("max_backoff_seconds", 300)),
+            zmq_ctx=zmq_ctx,
+        )
+        workers.append(w)
+        threading.Thread(
+            target=w.capture, daemon=True, name=f"RTSP_Capture_{cam_id}"
+        ).start()
+        threading.Thread(
+            target=w.encode, daemon=True, name=f"RTSP_Encode_{cam_id}"
+        ).start()
+        time.sleep(0.05)
+
+    print("\n" + "=" * 70)
+    print("▶️  RTSP СИСТЕМА ЗАПУЩЕНА")
+    enc_label = "h264_nvenc (GPU)" if use_nvenc else "libx264 (CPU)"
+    print(f"🖥️  Энкодер: {enc_label}")
+    print(f"📡 RTSP transport: {RTSP_TRANSPORT}")
+    if RECONNECT_ENABLED and STREAM_STALE_SEC > 0:
+        print(
+            f"🔄 Автопереподключение: вкл "
+            f"(порог {STREAM_STALE_SEC:.0f}s без кадров, повтор {RECONNECT_RETRY_SEC:.0f}s)"
+        )
+    print(f"📁 HLS: {BASE_OUTPUT_DIR}/")
+    for w in workers:
+        print(f"   • {w.camera_id} -> camera_{w.camera_id}/index.m3u8")
+    print("=" * 70 + "\n")
+
+    try:
+        while True:
+            time.sleep(5)
+            active = sum(1 for w in workers if w.running)
+            if active < len(workers):
+                print(f"⚠️  Активных RTSP камер: {active}/{len(workers)}")
+    except KeyboardInterrupt:
+        print("\n⏹️  Остановка RTSP...")
+        for w in workers:
+            w.stop()
+        time.sleep(1)
+        print("✅ Завершено")
+
+
+# =========================
+# MAIN (GigE)
+# =========================
+def main_gige():
     def _shutdown_handler(signum, _frame):
         raise KeyboardInterrupt
 
@@ -1619,7 +2079,12 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if CAMERA_SOURCE == "rtsp":
+            main_rtsp()
+        elif CAMERA_SOURCE == "gige":
+            main_gige()
+        else:
+            print(f"❌ Неподдерживаемый camera_source: {CAMERA_SOURCE!r} (ожидается gige или rtsp)")
     except Exception as e:
         print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
         traceback.print_exc()

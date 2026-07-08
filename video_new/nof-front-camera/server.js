@@ -435,8 +435,21 @@ function loadExpectedCameraIds() {
 
     try {
         const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-        const mapping = config.camera_mapping || {};
+        const source = String(config.camera_source || 'gige').trim().toLowerCase();
         const ids = new Set();
+
+        if (source === 'rtsp' && Array.isArray(config.rtsp_cameras)) {
+            for (const cam of config.rtsp_cameras) {
+                const cameraId = cam && (cam.id || cam.alias);
+                if (typeof cameraId !== 'string') continue;
+                const trimmed = cameraId.trim();
+                if (!trimmed) continue;
+                ids.add(`${CAMERA_FOLDER_PREFIX}${trimmed}`);
+            }
+            return Array.from(ids);
+        }
+
+        const mapping = config.camera_mapping || {};
 
         for (const value of Object.values(mapping)) {
             let cameraId = null;
