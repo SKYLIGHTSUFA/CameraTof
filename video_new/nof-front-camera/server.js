@@ -32,7 +32,11 @@ const CONFIG_FILE = path.resolve(
 );
 const CAMERA_FOLDER_PREFIX = process.env.CAMERA_FOLDER_PREFIX || 'camera_';
 const CONFIGS_FILE = path.join(DATA_DIR, 'configs.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const MAX_CONFIGS = 7;
+const SESSION_COOKIE = 'vw_session';
+const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const sessions = new Map();
 
 function loadStreamStaleSec() {
     if (process.env.STREAM_STALE_SEC) {
@@ -233,6 +237,123 @@ function isInside(parent, child) {
 app.use(express.static(PUBLIC_DIR));
 app.use(express.json());
 
+function parseCookies(cookieHeader = '') {
+    const cookies = {};
+    cookieHeader.split(';').forEach((part) => {
+        const idx = part.indexOf('=');
+        if (idx < 0) return;
+        const key = part.slice(0, idx).trim();
+        if (!key) return;
+        cookies[key] = decodeURIComponent(part.slice(idx + 1).trim());
+    });
+    return cookies;
+}
+
+function sessionCookieValue(sessionId, maxAgeSec) {
+    const parts = [
+        `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`,
+        'Path=/',
+        'HttpOnly',
+        'SameSite=Lax',
+        `Max-Age=${maxAgeSec}`
+    ];
+    if (process.env.AUTH_COOKIE_SECURE === 'true') parts.push('Secure');
+    return parts.join('; ');
+}
+
+function sanitizeUser(user) {
+    return {
+        id: user.id,
+        username: user.username,
+        role: user.role || 'user',
+        createdAt: user.createdAt || null
+    };
+}
+
+function hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    return `scrypt:${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+    const [scheme, salt, hash] = String(storedHash || '').split(':');
+    if (scheme !== 'scrypt' || !salt || !hash) return false;
+    const expected = Buffer.from(hash, 'hex');
+    const actual = crypto.scryptSync(password, salt, expected.length);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function loadUsers() {
+    ensureDataDir();
+    if (!fs.existsSync(USERS_FILE)) {
+        const username = process.env.AUTH_ADMIN_USER || 'admin';
+        const password = process.env.AUTH_ADMIN_PASSWORD || 'admin';
+        const admin = {
+            id: crypto.randomUUID(),
+            username,
+            passwordHash: hashPassword(password),
+            role: 'admin',
+            createdAt: new Date().toISOString()
+        };
+        fs.writeFileSync(USERS_FILE, JSON.stringify([admin], null, 2), 'utf8');
+        console.warn(`Auth users file created. Initial admin: ${username}` +
+            (process.env.AUTH_ADMIN_PASSWORD ? '' : ' / admin'));
+        return [admin];
+    }
+
+    try {
+        const parsed = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+        console.error('Error reading users:', error.message);
+        return [];
+    }
+}
+
+function saveUsers(users) {
+    ensureDataDir();
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function findUserByUsername(username) {
+    const normalized = String(username || '').trim().toLowerCase();
+    return loadUsers().find(user => user.username.toLowerCase() === normalized) || null;
+}
+
+function getSessionUser(req) {
+    const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE];
+    if (!sessionId) return null;
+    const session = sessions.get(sessionId);
+    if (!session || session.expiresAt <= Date.now()) {
+        sessions.delete(sessionId);
+        return null;
+    }
+    const user = loadUsers().find(item => item.id === session.userId);
+    if (!user) {
+        sessions.delete(sessionId);
+        return null;
+    }
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    return user;
+}
+
+function requireAuth(req, res, next) {
+    const user = getSessionUser(req);
+    if (!user) {
+        return res.status(401).json({ error: 'Требуется вход' });
+    }
+    req.user = user;
+    next();
+}
+
+function requireAdmin(req, res, next) {
+    if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Недостаточно прав' });
+    }
+    next();
+}
+
 function stripCameraPrefix(folderName) {
     if (folderName.startsWith(CAMERA_FOLDER_PREFIX)) {
         return folderName.slice(CAMERA_FOLDER_PREFIX.length);
@@ -430,6 +551,79 @@ function saveConfigs(configs) {
     ensureDataDir();
     fs.writeFileSync(CONFIGS_FILE, JSON.stringify(configs, null, 2), 'utf8');
 }
+
+app.get('/api/auth/me', (req, res) => {
+    const user = getSessionUser(req);
+    res.json({ user: user ? sanitizeUser(user) : null });
+});
+
+app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body || {};
+    if (typeof username !== 'string' || typeof password !== 'string') {
+        return res.status(400).json({ error: 'Введите логин и пароль' });
+    }
+
+    const user = findUserByUsername(username);
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+        return res.status(401).json({ error: 'Неверный логин или пароль' });
+    }
+
+    const sessionId = crypto.randomBytes(32).toString('hex');
+    sessions.set(sessionId, {
+        userId: user.id,
+        expiresAt: Date.now() + SESSION_TTL_MS
+    });
+    res.setHeader('Set-Cookie', sessionCookieValue(sessionId, SESSION_TTL_MS / 1000));
+    res.json({ user: sanitizeUser(user) });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE];
+    if (sessionId) sessions.delete(sessionId);
+    res.setHeader('Set-Cookie', sessionCookieValue('', 0));
+    res.json({ ok: true });
+});
+
+app.get('/api/users', requireAuth, requireAdmin, (req, res) => {
+    res.json(loadUsers().map(sanitizeUser));
+});
+
+app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
+    const { username, password, role } = req.body || {};
+    const cleanUsername = typeof username === 'string' ? username.trim() : '';
+    const cleanRole = role === 'admin' ? 'admin' : 'user';
+
+    if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(cleanUsername)) {
+        return res.status(400).json({ error: 'Логин: 3-32 символа, латиница/цифры/._-' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
+        return res.status(400).json({ error: 'Пароль должен быть не короче 6 символов' });
+    }
+
+    const users = loadUsers();
+    if (users.some(user => user.username.toLowerCase() === cleanUsername.toLowerCase())) {
+        return res.status(409).json({ error: 'Пользователь уже существует' });
+    }
+
+    const user = {
+        id: crypto.randomUUID(),
+        username: cleanUsername,
+        passwordHash: hashPassword(password),
+        role: cleanRole,
+        createdAt: new Date().toISOString()
+    };
+
+    try {
+        saveUsers([...users, user]);
+    } catch (error) {
+        console.error('Error saving users:', error.message);
+        return res.status(500).json({ error: 'Не удалось сохранить пользователя' });
+    }
+
+    res.status(201).json(sanitizeUser(user));
+});
+
+app.use(['/api', '/hls'], requireAuth);
 
 app.get('/api/cameras', (req, res) => {
     let filterIds = null;

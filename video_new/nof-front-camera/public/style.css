@@ -36,6 +36,43 @@ html, body {
 
 body { display: flex; flex-direction: column; overflow: hidden; }
 
+body:not(.authenticated) .topbar,
+body:not(.authenticated) .stage,
+body:not(.authenticated) .statusbar {
+    display: none;
+}
+
+body.authenticated .auth-screen {
+    display: none;
+}
+
+.auth-screen {
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: radial-gradient(circle at top, rgba(0, 230, 118, 0.14), transparent 34%), var(--bg);
+}
+
+.auth-card {
+    width: 100%;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 30px;
+    background: var(--panel);
+    border: 2px solid var(--line);
+    border-radius: 16px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .55);
+}
+
+.auth-mark { margin-bottom: 4px; }
+.auth-title { margin: 0; font-size: 28px; line-height: 1.15; }
+.auth-subtitle { margin: -4px 0 10px; color: var(--muted); }
+.auth-submit { width: 100%; margin-top: 4px; }
+
 /* ---------- Верхняя панель ---------- */
 
 .topbar {
@@ -197,6 +234,37 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 }
 .btn-add:hover { filter: brightness(1.1); }
 .btn-add:disabled { background: var(--panel-2); color: var(--muted); cursor: not-allowed; filter: none; }
+
+.user-panel {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.user-name {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: var(--fs-sm);
+    font-weight: 700;
+}
+
+.btn-small {
+    border: 2px solid var(--line);
+    border-radius: 9px;
+    padding: 8px 12px;
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: var(--fs-sm);
+    font-weight: 700;
+    cursor: pointer;
+}
+.btn-small:hover { border-color: var(--accent); }
+.btn-small-ghost { background: transparent; color: var(--muted); }
+.btn-small[hidden] { display: none; }
 
 /* ---------- Сцена с камерами ---------- */
 
@@ -554,6 +622,44 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .modal-error[hidden] { display: none; }
 
 .modal-actions { display: flex; justify-content: flex-end; gap: 12px; }
+
+.users-list {
+    max-height: 220px;
+    overflow-y: auto;
+    margin-bottom: 18px;
+    border: 2px solid var(--line);
+    border-radius: 10px;
+    background: var(--bg);
+}
+
+.user-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+}
+.user-row:last-child { border-bottom: none; }
+
+.user-row-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 700;
+}
+
+.user-role {
+    flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 3px 9px;
+    color: var(--accent);
+    background: rgba(0, 230, 118, 0.12);
+    font-size: var(--fs-xs);
+    font-weight: 800;
+}
 
 .btn {
     border: none;

@@ -8,6 +8,20 @@
     <script src="/hls.js"></script>
 </head>
 <body>
+    <section class="auth-screen" id="authScreen">
+        <form class="auth-card" id="loginForm">
+            <div class="brand-mark auth-mark" aria-hidden="true">VW</div>
+            <h1 class="auth-title">Вход в видеостену</h1>
+            <p class="auth-subtitle">Введите логин и пароль</p>
+            <label class="modal-label" for="loginUsername">Логин</label>
+            <input type="text" id="loginUsername" class="modal-input" autocomplete="username" required>
+            <label class="modal-label" for="loginPassword">Пароль</label>
+            <input type="password" id="loginPassword" class="modal-input" autocomplete="current-password" required>
+            <div class="modal-error" id="loginError" hidden></div>
+            <button class="btn btn-primary auth-submit" type="submit">Войти</button>
+        </form>
+    </section>
+
     <header class="topbar">
         <div class="brand">
             <div class="brand-mark" aria-hidden="true">VW</div>
@@ -18,6 +32,11 @@
         </div>
         <div class="tabs" id="tabs"></div>
         <button class="btn-add" id="btnAdd" type="button">+ Добавить</button>
+        <div class="user-panel">
+            <span class="user-name" id="userName"></span>
+            <button class="btn-small" id="btnUsers" type="button" hidden>Пользователи</button>
+            <button class="btn-small btn-small-ghost" id="btnLogout" type="button">Выйти</button>
+        </div>
     </header>
 
     <main class="stage">
@@ -55,6 +74,44 @@
         </div>
     </div>
 
+    <!-- Окно управления пользователями -->
+    <div class="modal-overlay" id="usersModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="usersModalTitle">
+            <h2 class="modal-title" id="usersModalTitle">Пользователи</h2>
+
+            <div class="users-list" id="usersList">
+                <div class="muted">Загрузка пользователей…</div>
+            </div>
+
+            <div class="modal-section">
+                <label class="modal-label" for="newUsername">Логин</label>
+                <input type="text" id="newUsername" class="modal-input"
+                       placeholder="operator1" maxlength="32" autocomplete="off">
+            </div>
+
+            <div class="modal-section">
+                <label class="modal-label" for="newPassword">Пароль</label>
+                <input type="password" id="newPassword" class="modal-input"
+                       placeholder="Минимум 6 символов" autocomplete="new-password">
+            </div>
+
+            <div class="modal-section">
+                <label class="modal-label" for="newRole">Роль</label>
+                <select id="newRole" class="modal-input">
+                    <option value="user">Пользователь</option>
+                    <option value="admin">Администратор</option>
+                </select>
+            </div>
+
+            <div class="modal-error" id="usersError" hidden></div>
+
+            <div class="modal-actions">
+                <button class="btn btn-ghost" id="btnUsersClose" type="button">Закрыть</button>
+                <button class="btn btn-primary" id="btnCreateUser" type="button">Создать</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const MAX_CONFIGS = 7;
 
@@ -64,8 +121,78 @@
         let players = {};         // HLS-плееры только активной вкладки
         let lastSignature = '';
         let refreshTimer = null;
+        let currentUser = null;
+        let appEventsBound = false;
 
         const $ = (id) => document.getElementById(id);
+
+        // ---------- Аутентификация ----------
+
+        function showLogin(message = '') {
+            currentUser = null;
+            if (refreshTimer) clearInterval(refreshTimer);
+            refreshTimer = null;
+            destroyPlayers();
+            document.body.classList.remove('authenticated');
+            $('loginError').hidden = true;
+            if (message) {
+                $('loginError').textContent = message;
+                $('loginError').hidden = false;
+            }
+            setTimeout(() => $('loginUsername').focus(), 50);
+        }
+
+        async function apiFetch(url, options = {}) {
+            const res = await fetch(url, options);
+            if (res.status === 401) {
+                showLogin('Сессия истекла, войдите снова');
+                throw new Error('auth_required');
+            }
+            return res;
+        }
+
+        async function fetchCurrentUser() {
+            const res = await fetch('/api/auth/me');
+            if (!res.ok) return null;
+            const data = await res.json().catch(() => ({}));
+            return data.user || null;
+        }
+
+        function updateUserPanel() {
+            $('userName').textContent = currentUser ? currentUser.username : '';
+            $('btnUsers').hidden = !currentUser || currentUser.role !== 'admin';
+        }
+
+        async function login(e) {
+            e.preventDefault();
+            $('loginError').hidden = true;
+            const username = $('loginUsername').value.trim();
+            const password = $('loginPassword').value;
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    $('loginError').textContent = data.error || 'Не удалось войти';
+                    $('loginError').hidden = false;
+                    return;
+                }
+                $('loginPassword').value = '';
+                await startAuthenticatedApp(data.user);
+            } catch (error) {
+                $('loginError').textContent = 'Ошибка сети при входе';
+                $('loginError').hidden = false;
+            }
+        }
+
+        async function logout() {
+            await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+            showLogin();
+        }
 
         /** Видео грузим только на вкладке секции/конфига, не на «Все камеры». */
         function isVideoTab(id) {
@@ -81,9 +208,10 @@
 
         async function fetchCameras() {
             try {
-                const res = await fetch('/api/cameras');
+                const res = await apiFetch('/api/cameras');
                 return res.ok ? await res.json() : [];
             } catch (e) {
+                if (e.message === 'auth_required') throw e;
                 console.error('Error fetching cameras:', e);
                 return [];
             }
@@ -91,9 +219,10 @@
 
         async function fetchConfigs() {
             try {
-                const res = await fetch('/api/configs');
+                const res = await apiFetch('/api/configs');
                 return res.ok ? await res.json() : [];
             } catch (e) {
+                if (e.message === 'auth_required') throw e;
                 console.error('Error fetching configs:', e);
                 return [];
             }
@@ -567,7 +696,7 @@
             if (savedConfigCount() >= MAX_CONFIGS) return showModalError(`Достигнут лимит в ${MAX_CONFIGS} конфигураций`);
 
             try {
-                const res = await fetch('/api/configs', {
+                const res = await apiFetch('/api/configs', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name, cameras })
@@ -589,7 +718,7 @@
             ev.stopPropagation();
             if (!confirm(`Удалить конфигурацию «${label}»?`)) return;
             try {
-                const res = await fetch('/api/configs/' + id, { method: 'DELETE' });
+                const res = await apiFetch('/api/configs/' + id, { method: 'DELETE' });
                 if (!res.ok) { alert('Не удалось удалить конфигурацию'); return; }
                 configs = configs.filter(c => c.id !== id);
                 if (activeId === id) activeId = defaultActiveId();
@@ -600,27 +729,129 @@
             }
         }
 
+        // ---------- Пользователи ----------
+
+        function closeUsersModal() {
+            $('usersModal').hidden = true;
+        }
+
+        function showUsersError(msg) {
+            const el = $('usersError');
+            el.textContent = msg;
+            el.hidden = false;
+        }
+
+        function renderUsers(users) {
+            const list = $('usersList');
+            if (!users.length) {
+                list.innerHTML = '<div class="muted">Пользователи не найдены</div>';
+                return;
+            }
+
+            list.innerHTML = '';
+            users.forEach(user => {
+                const row = document.createElement('div');
+                row.className = 'user-row';
+
+                const name = document.createElement('span');
+                name.className = 'user-row-name';
+                name.textContent = user.username;
+
+                const role = document.createElement('span');
+                role.className = 'user-role';
+                role.textContent = user.role === 'admin' ? 'admin' : 'user';
+
+                row.appendChild(name);
+                row.appendChild(role);
+                list.appendChild(row);
+            });
+        }
+
+        async function loadUsers() {
+            const res = await apiFetch('/api/users');
+            if (!res.ok) throw new Error('users_load_failed');
+            renderUsers(await res.json());
+        }
+
+        async function openUsersModal() {
+            if (!currentUser || currentUser.role !== 'admin') return;
+            $('usersError').hidden = true;
+            $('newUsername').value = '';
+            $('newPassword').value = '';
+            $('newRole').value = 'user';
+            $('usersList').innerHTML = '<div class="muted">Загрузка пользователей…</div>';
+            $('usersModal').hidden = false;
+
+            try {
+                await loadUsers();
+                setTimeout(() => $('newUsername').focus(), 50);
+            } catch (error) {
+                showUsersError('Не удалось загрузить пользователей');
+            }
+        }
+
+        async function createUser() {
+            $('usersError').hidden = true;
+            const username = $('newUsername').value.trim();
+            const password = $('newPassword').value;
+            const role = $('newRole').value;
+
+            try {
+                const res = await apiFetch('/api/users', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, role })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) return showUsersError(data.error || 'Не удалось создать пользователя');
+                $('newUsername').value = '';
+                $('newPassword').value = '';
+                $('newRole').value = 'user';
+                await loadUsers();
+                setTimeout(() => $('newUsername').focus(), 50);
+            } catch (error) {
+                if (error.message !== 'auth_required') {
+                    showUsersError('Ошибка сети при создании пользователя');
+                }
+            }
+        }
+
         // ---------- Автообновление ----------
 
         async function refresh() {
-            allCameras = await fetchCameras();
-            renderTabs();
-            render(false);
-            updateMetricsInGrid();
+            try {
+                allCameras = await fetchCameras();
+                renderTabs();
+                render(false);
+                updateMetricsInGrid();
+            } catch (error) {
+                if (error.message !== 'auth_required') {
+                    console.error('Refresh failed:', error);
+                }
+            }
         }
 
         // ---------- Инициализация ----------
 
-        async function init() {
-            configs = await fetchConfigs();
-            allCameras = await fetchCameras();
-            activeId = defaultActiveId();
-            renderTabs();
-            render(true);
+        function bindAppEvents() {
+            if (appEventsBound) return;
+            appEventsBound = true;
 
-            refreshTimer = setInterval(refresh, 10000);
+            window.addEventListener('resize', () => optimizeGridLayout());
+
+            $('btnAdd').addEventListener('click', openModal);
+            $('btnCancel').addEventListener('click', closeModal);
+            $('btnSave').addEventListener('click', saveConfig);
+            $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
+            $('btnUsers').addEventListener('click', openUsersModal);
+            $('btnUsersClose').addEventListener('click', closeUsersModal);
+            $('btnCreateUser').addEventListener('click', createUser);
+            $('btnLogout').addEventListener('click', logout);
+            $('usersModal').addEventListener('click', (e) => { if (e.target === $('usersModal')) closeUsersModal(); });
+            $('loginForm').addEventListener('submit', login);
 
             document.addEventListener('visibilitychange', () => {
+                if (!currentUser) return;
                 if (document.hidden) {
                     destroyPlayers();
                 } else if (isVideoTab(activeId)) {
@@ -628,19 +859,50 @@
                     render(true);
                 }
             });
-            window.addEventListener('resize', () => optimizeGridLayout());
 
-            $('btnAdd').addEventListener('click', openModal);
-            $('btnCancel').addEventListener('click', closeModal);
-            $('btnSave').addEventListener('click', saveConfig);
-            $('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
             document.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape') {
-                    if (!$('modal').hidden) closeModal();
+                    if (!$('usersModal').hidden) closeUsersModal();
+                    else if (!$('modal').hidden) closeModal();
                     else if (document.fullscreenElement) document.exitFullscreen();
                 }
             });
             $('configName').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveConfig(); });
+            $('newPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') createUser(); });
+        }
+
+        async function startAuthenticatedApp(user) {
+            currentUser = user;
+            updateUserPanel();
+            bindAppEvents();
+            if (refreshTimer) clearInterval(refreshTimer);
+            destroyPlayers();
+            lastSignature = '';
+
+            configs = await fetchConfigs();
+            allCameras = await fetchCameras();
+            activeId = defaultActiveId();
+            document.body.classList.add('authenticated');
+            renderTabs();
+            render(true);
+
+            refreshTimer = setInterval(refresh, 10000);
+        }
+
+        async function init() {
+            bindAppEvents();
+            const user = await fetchCurrentUser();
+            if (!user) {
+                showLogin();
+                return;
+            }
+            try {
+                await startAuthenticatedApp(user);
+            } catch (error) {
+                if (error.message !== 'auth_required') {
+                    showLogin('Не удалось загрузить данные после входа');
+                }
+            }
         }
 
         window.addEventListener('beforeunload', () => {
