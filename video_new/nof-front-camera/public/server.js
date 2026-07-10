@@ -59,18 +59,29 @@ function stripCameraPrefix(folderName) {
     return folderName;
 }
 
-function getSectionFromCameraId(folderName) {
-    const shortId = stripCameraPrefix(folderName);
+function parseSectionFromShortId(shortId) {
     const dot = shortId.indexOf('.');
-    return dot > 0 ? shortId.slice(0, dot) : shortId;
+    if (dot > 0) return shortId.slice(0, dot);
+    const dash = shortId.indexOf('-');
+    if (dash > 0) return shortId.slice(0, dash);
+    return shortId;
 }
 
-/** Линия = первые два сегмента ID, например 90.2 из 90.2.4 */
-function getLineFromCameraId(folderName) {
-    const shortId = stripCameraPrefix(folderName);
+/** Линия: 90.2 из 90.2.4 (GigE) или 2 из 2-3 (RTSP). */
+function parseLineFromShortId(shortId) {
     const parts = shortId.split('.');
     if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+    const dash = shortId.indexOf('-');
+    if (dash > 0) return shortId.slice(0, dash);
     return shortId;
+}
+
+function getSectionFromCameraId(folderName) {
+    return parseSectionFromShortId(stripCameraPrefix(folderName));
+}
+
+function getLineFromCameraId(folderName) {
+    return parseLineFromShortId(stripCameraPrefix(folderName));
 }
 
 function findPlaylistFile(cameraPath) {

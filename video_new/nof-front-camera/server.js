@@ -372,18 +372,29 @@ function stripCameraPrefix(folderName) {
     return folderName;
 }
 
-function getSectionFromCameraId(folderName) {
-    const shortId = stripCameraPrefix(folderName);
+function parseSectionFromShortId(shortId) {
     const dot = shortId.indexOf('.');
-    return dot > 0 ? shortId.slice(0, dot) : shortId;
+    if (dot > 0) return shortId.slice(0, dot);
+    const dash = shortId.indexOf('-');
+    if (dash > 0) return shortId.slice(0, dash);
+    return shortId;
 }
 
-/** Линия = первые два сегмента ID, например 90.2 из 90.2.4 */
-function getLineFromCameraId(folderName) {
-    const shortId = stripCameraPrefix(folderName);
+/** Линия: 90.2 из 90.2.4 (GigE) или 2 из 2-3 (RTSP). */
+function parseLineFromShortId(shortId) {
     const parts = shortId.split('.');
     if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
+    const dash = shortId.indexOf('-');
+    if (dash > 0) return shortId.slice(0, dash);
     return shortId;
+}
+
+function getSectionFromCameraId(folderName) {
+    return parseSectionFromShortId(stripCameraPrefix(folderName));
+}
+
+function getLineFromCameraId(folderName) {
+    return parseLineFromShortId(stripCameraPrefix(folderName));
 }
 
 function findPlaylistFile(cameraPath) {
@@ -649,7 +660,7 @@ app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
 
 app.use(['/api', '/hls'], requireAuth);
 
-app.get('/api/cameras', (req, res) => {
+app.get('/api/cameras', async (req, res) => {
     let filterIds = null;
     if (req.query.ids) {
         filterIds = req.query.ids.split('-')
@@ -657,8 +668,15 @@ app.get('/api/cameras', (req, res) => {
             .filter(id => id !== '');
     }
 
-    refreshFoamMetricsInBackground();
-    const metricsByName = FOAM_METRICS.enabled ? getCachedFoamMetrics() : {};
+    let metricsByName = {};
+    if (FOAM_METRICS.enabled) {
+        const force = req.query.forceMetrics === '1' || req.query.forceMetrics === 'true';
+        const result = await getFoamMetrics(force);
+        metricsByName = result.metrics || {};
+        if (result.error) {
+            res.setHeader('X-Foam-Metrics-Error', result.error.slice(0, 200));
+        }
+    }
 
     res.json(getCameras(filterIds, metricsByName));
 });
@@ -787,7 +805,21 @@ app.listen(PORT, () => {
         (FOAM_METRICS.enabled ? ` (window ${FOAM_METRICS.window_minutes} min, DB ${FOAM_METRICS.database_host})` : ''));
 
     if (FOAM_METRICS.enabled) {
-        refreshFoamMetricsInBackground();
+        getFoamMetrics(true).then((result) => {
+            const count = Object.keys(result.metrics || {}).length;
+            if (result.error) {
+                console.error(`Foam metrics initial load failed: ${result.error}`);
+            } else if (count === 0) {
+                console.warn(
+                    `Foam metrics: no data in DB for the last ${FOAM_METRICS.window_minutes} min ` +
+                    `(table features, cam like FM_101-1-1; check foam inference + postgres)`
+                );
+            } else {
+                console.log(`Foam metrics: loaded for ${count} camera(s)`);
+            }
+        }).catch((err) => {
+            console.error(`Foam metrics initial load failed: ${err.message}`);
+        });
     }
 
     if (!chokidar) return;
