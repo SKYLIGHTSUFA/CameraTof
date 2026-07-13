@@ -8,6 +8,9 @@ services:
     ports:
       - "4010:4010"
     volumes:
+      # Исходники фронта монтируются с хоста, чтобы обновлять UI без rebuild образа.
+      - ./server.js:/app/server.js:ro
+      - ./public:/app/public:ro
       # Та же папка, куда backend пишет HLS (в docker-compose backend: /mnt/test_ramdisk)
       - /mnt/test_ramdisk:/hls_output:ro
       # Список камер и секций из backend config.json

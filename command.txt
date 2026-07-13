@@ -1,0 +1,12 @@
+docker exec gige-hls-front node -e "const fs=require('fs'); const s=fs.readFileSync('/app/server.js','utf8'); console.log(s.includes('parseSectionFromShortId'), s.includes(\"indexOf('-')\"))"
+
+
+
+
+cd video_new/nof-front-camera
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+
+
+

@@ -779,6 +779,7 @@ class CameraWorker:
         zmq_ctx: zmq.Context | None = None,
         harvester: Harvester | None = None,
         device_index: int = -1,
+        device_key: str | None = None,
         cam_cfg: dict | None = None,
     ):
         self.device       = device      # harvesters ImageAcquirer
@@ -790,6 +791,7 @@ class CameraWorker:
         self.zmq_socket   = None
         self.harvester    = harvester
         self.device_index = device_index
+        self.device_key   = device_key
         self._device_lock = threading.Lock()
         self._stale_lock = threading.Lock()
         self._acquisition_start_time = 0.0
@@ -977,7 +979,9 @@ class CameraWorker:
             return False
 
     def _reconnect_device(self) -> bool:
-        if not RECONNECT_ENABLED or self.harvester is None or self.device_index < 0:
+        if not RECONNECT_ENABLED or self.harvester is None:
+            return False
+        if self.device_key is None and self.device_index < 0:
             return False
 
         with self._device_lock:
@@ -990,15 +994,25 @@ class CameraWorker:
             except Exception:
                 pass
 
-            try:
-                self.harvester.update()
-            except Exception as e:
-                print(
-                    f"[CAM {self.display_name} ({self.camera_id})] "
-                    f"⚠️ harvester.update failed: {e}"
+            device = None
+            if self.device_key:
+                device, index = open_camera_by_key(
+                    self.harvester,
+                    self.device_key,
+                    label=self.display_name,
                 )
+                if index is not None:
+                    self.device_index = index
+            elif self.device_index >= 0:
+                try:
+                    self.harvester.update()
+                except Exception as e:
+                    print(
+                        f"[CAM {self.display_name} ({self.camera_id})] "
+                        f"⚠️ harvester.update failed: {e}"
+                    )
+                device = open_camera_with_retry(self.harvester, self.device_index)
 
-            device = open_camera_with_retry(self.harvester, self.device_index)
             if device is None:
                 return False
 
@@ -1588,6 +1602,13 @@ class RtspCameraWorker:
 # =========================
 # ОТКРЫТИЕ КАМЕРЫ С ПОВТОРНЫМИ ПОПЫТКАМИ
 # =========================
+def _find_device_index(h: Harvester, device_key: str) -> int | None:
+    for i, di in enumerate(h.device_info_list):
+        if _device_unique_key(di) == device_key:
+            return i
+    return None
+
+
 def open_camera_with_retry(h: Harvester, index: int, max_retries: int = MAX_RETRIES):
     for attempt in range(max_retries):
         try:
@@ -1616,6 +1637,48 @@ def open_camera_with_retry(h: Harvester, index: int, max_retries: int = MAX_RETR
 
     print(f"   Не удалось открыть камеру {index}")
     return None
+
+
+def open_camera_by_key(
+    h: Harvester,
+    device_key: str,
+    max_retries: int = MAX_RETRIES,
+    label: str = "",
+) -> tuple[object | None, int | None]:
+    tag = label or device_key
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                print(f"   Попытка {attempt + 1}/{max_retries} для {tag}...")
+                time.sleep(RETRY_DELAY)
+
+            h.update()
+            index = _find_device_index(h, device_key)
+            if index is None:
+                continue
+
+            device = h.create(index)
+            if device is not None:
+                print(f"   Камера {tag} открыта (index={index})")
+                return device, index
+
+        except Exception as e:
+            err = str(e)
+            print(f"   Ошибка {tag}: {err}")
+
+            if "-1005" in err or "denied" in err.lower():
+                try:
+                    index = _find_device_index(h, device_key)
+                    if index is not None:
+                        tmp = h.create(index)
+                        if tmp:
+                            tmp.destroy()
+                            time.sleep(1)
+                except Exception:
+                    pass
+
+    print(f"   Не удалось открыть {tag}")
+    return None, None
 
 
 # =========================
@@ -1718,17 +1781,17 @@ def discover_cameras(h: Harvester) -> list:
         for key in sorted(merged.keys(), key=lambda k: merged[k]["display_name"]):
             info = merged[key]
             idx = index_by_key.get(key)
-            if idx is None:
-                missing_after_final.append(info["display_name"])
-                continue
             display_name = info["display_name"]
+            if idx is None:
+                missing_after_final.append(display_name)
             cameras_info.append({
-                "index":         idx,
-                "display_name":  display_name,
-                "camera_id":     get_camera_id(display_name),
-                "access_status": info.get("access_status"),
-                "passes_seen":   info.get("passes_seen", 1),
-                "device_key":    key,
+                "index":           idx,
+                "display_name":    display_name,
+                "camera_id":       get_camera_id(display_name),
+                "access_status":   info.get("access_status"),
+                "passes_seen":     info.get("passes_seen", 1),
+                "device_key":      key,
+                "discovery_stale": idx is None,
             })
 
         if not missing_after_final or refresh_attempt == 1:
@@ -1740,16 +1803,18 @@ def discover_cameras(h: Harvester) -> list:
         )
         time.sleep(DISCOVERY_PASS_DELAY_SEC)
 
+    online_count = sum(1 for cam in cameras_info if cam["index"] is not None)
+    stale_count = len(missing_after_final)
     print(
         f"📸 Discovery merged: {len(merged)} unique, "
-        f"{len(cameras_info)} ready to open "
+        f"{online_count} online, {stale_count} stale (retry at open) "
         f"(pass counts: {pass_counts})"
     )
 
     if missing_after_final:
         print(
-            f"⚠️  {len(missing_after_final)} camera(s) seen earlier but missing "
-            f"after final refresh:"
+            f"⚠️  {stale_count} camera(s) seen earlier but missing "
+            f"after final refresh (will retry by MAC):"
         )
         for name in missing_after_final:
             print(f"      - {name}")
@@ -1776,6 +1841,76 @@ def discover_cameras(h: Harvester) -> list:
             print(f"      - {cam['camera_id']} {cam['display_name']}")
 
     return cameras_info
+
+
+def _start_gige_camera_worker(
+    info: dict,
+    device,
+    use_nvenc: bool,
+    gpu_id: int,
+    zmq_ctx,
+    harvester: Harvester,
+) -> CameraWorker:
+    cam_cfg = get_camera_config(info["display_name"])
+    w = CameraWorker(
+        device,
+        info["camera_id"],
+        info["display_name"],
+        use_nvenc,
+        gpu_id,
+        zmq_ctx=zmq_ctx,
+        harvester=harvester,
+        device_index=info["index"],
+        device_key=info.get("device_key"),
+        cam_cfg=cam_cfg,
+    )
+    threading.Thread(
+        target=w.capture, daemon=True,
+        name=f"Capture_{info['camera_id']}",
+    ).start()
+    threading.Thread(
+        target=w.encode, daemon=True,
+        name=f"Encode_{info['camera_id']}",
+    ).start()
+    return w
+
+
+def _pending_camera_opener(
+    harvester: Harvester,
+    pending: list[dict],
+    workers: list,
+    workers_lock: threading.Lock,
+    gpu_ids: list,
+    use_nvenc: bool,
+    zmq_ctx,
+):
+    while pending:
+        time.sleep(RECONNECT_RETRY_SEC)
+        still_pending: list[dict] = []
+        for cam in pending:
+            device, index = open_camera_by_key(
+                harvester,
+                cam["device_key"],
+                max_retries=3,
+                label=cam["display_name"],
+            )
+            if device is None or index is None:
+                still_pending.append(cam)
+                continue
+
+            cam = {**cam, "index": index}
+            with workers_lock:
+                gpu_id = gpu_ids[len(workers) % len(gpu_ids)]
+            w = _start_gige_camera_worker(
+                cam, device, use_nvenc, gpu_id, zmq_ctx, harvester
+            )
+            with workers_lock:
+                workers.append(w)
+            print(
+                f"✅ Фоновое подключение: {cam['display_name']} "
+                f"-> camera_{cam['camera_id']}/index.m3u8"
+            )
+        pending = still_pending
 
 
 def list_cameras(h: Harvester) -> list:
@@ -1960,6 +2095,12 @@ def main_gige():
     camera_count = len(cameras_info)
 
     print(f"\n📸 Найдено камер: {camera_count}")
+    stale_count = sum(1 for cam in cameras_info if cam.get("discovery_stale"))
+    if stale_count:
+        print(
+            f"   ({stale_count} с нестабильным ответом — "
+            f"попытка подключения при старте и в фоне)"
+        )
     if camera_count == 0:
         print("❌ Камеры не обнаружены.")
         return
@@ -1968,24 +2109,57 @@ def main_gige():
     for cam in cameras_info:
         access = cam.get("access_status")
         access_note = ""
-        if access == 3:
+        if cam.get("discovery_stale"):
+            access_note = " [STALE]"
+        elif access == 3:
             access_note = " [NOACCESS]"
         elif access == 1:
             access_note = " [OK]"
+        index_label = cam["index"] if cam["index"] is not None else "?"
         print(
-            f"   [{cam['index']}] {cam['display_name']} -> "
+            f"   [{index_label}] {cam['display_name']} -> "
             f"ID: {cam['camera_id']}{access_note}"
         )
 
     print("\n🔧 Открытие камер...")
     devices_with_info = []
+    pending_cameras: list[dict] = []
+    stale_open_retries = max(MAX_RETRIES, DISCOVERY_PASSES + 2)
+
     for cam in cameras_info:
-        device = open_camera_with_retry(h, cam["index"])
-        if device is not None:
-            devices_with_info.append({**cam, "device": device})
+        device = None
+        resolved_index = cam.get("index")
+
+        if cam.get("discovery_stale") or resolved_index is None:
+            print(f"   ⏳ {cam['display_name']} — повторное обнаружение по MAC...")
+            device, resolved_index = open_camera_by_key(
+                harvester=h,
+                device_key=cam["device_key"],
+                max_retries=stale_open_retries,
+                label=cam["display_name"],
+            )
+        else:
+            device = open_camera_with_retry(h, resolved_index)
+
+        if device is not None and resolved_index is not None:
+            devices_with_info.append({
+                **cam,
+                "device": device,
+                "index": resolved_index,
+            })
+        else:
+            pending_cameras.append(cam)
+            print(
+                f"   ⚠️ {cam['display_name']} — не открыта сейчас, "
+                f"фоновое подключение каждые {RECONNECT_RETRY_SEC:.0f}s"
+            )
 
     print(f"\n✅ Открыто {len(devices_with_info)} из {camera_count} камер")
-    if not devices_with_info:
+    if pending_cameras:
+        print(
+            f"⏳ В очереди фонового подключения: {len(pending_cameras)} камер(ы)"
+        )
+    if not devices_with_info and not pending_cameras:
         print("❌ Нет доступных камер.")
         return
 
@@ -2012,32 +2186,28 @@ def main_gige():
 
     print("\n🚀 Запуск потоков...")
     workers = []
+    workers_lock = threading.Lock()
     for i, info in enumerate(devices_with_info):
         gpu_id = gpu_ids[i % len(gpu_ids)]
-
-        cam_cfg = get_camera_config(info["display_name"])
-
-        w = CameraWorker(
-            info["device"],
-            info["camera_id"],
-            info["display_name"],
-            use_nvenc,
-            gpu_id,
-            zmq_ctx=zmq_ctx,
-            harvester=h,
-            device_index=info["index"],
-            cam_cfg=cam_cfg,
+        w = _start_gige_camera_worker(
+            info, info["device"], use_nvenc, gpu_id, zmq_ctx, h
         )
         workers.append(w)
 
+    if pending_cameras:
         threading.Thread(
-            target=w.capture, daemon=True,
-            name=f"Capture_{info['camera_id']}"
-        ).start()
-
-        threading.Thread(
-            target=w.encode, daemon=True,
-            name=f"Encode_{info['camera_id']}"
+            target=_pending_camera_opener,
+            args=(
+                h,
+                list(pending_cameras),
+                workers,
+                workers_lock,
+                gpu_ids,
+                use_nvenc,
+                zmq_ctx,
+            ),
+            daemon=True,
+            name="PendingCameraOpener",
         ).start()
 
     print("\n" + "=" * 70)
@@ -2057,9 +2227,12 @@ def main_gige():
     try:
         while True:
             time.sleep(5)
-            active = sum(1 for w in workers if w.running)
-            if active < len(workers):
-                print(f"⚠️  Активных камер: {active}/{len(workers)}")
+            with workers_lock:
+                active_workers = list(workers)
+            active = sum(1 for w in active_workers if w.running)
+            total = len(cameras_info)
+            if active < total:
+                print(f"⚠️  Активных камер: {active}/{total}")
     except KeyboardInterrupt:
         print("\n⏹️  Остановка...")
         for w in workers:
