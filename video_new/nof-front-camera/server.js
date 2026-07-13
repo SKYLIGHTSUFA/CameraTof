@@ -261,6 +261,18 @@ function sessionCookieValue(sessionId, maxAgeSec) {
     return parts.join('; ');
 }
 
+function clearSessionCookie() {
+    const parts = [
+        `${SESSION_COOKIE}=`,
+        'Path=/',
+        'HttpOnly',
+        'SameSite=Lax',
+        'Max-Age=0'
+    ];
+    if (process.env.AUTH_COOKIE_SECURE === 'true') parts.push('Secure');
+    return parts.join('; ');
+}
+
 function sanitizeUser(user) {
     return {
         id: user.id,
@@ -298,8 +310,8 @@ function verifyPassword(password, storedHash) {
 function loadUsers() {
     ensureDataDir();
     if (!fs.existsSync(USERS_FILE)) {
-        const username = process.env.AUTH_ADMIN_USER || 'admin';
-        const password = process.env.AUTH_ADMIN_PASSWORD || 'admin';
+        const username = process.env.AUTH_ADMIN_USER || 'Khomovskiy';
+        const password = process.env.AUTH_ADMIN_PASSWORD || 'Kh7!mP2#xL9@';
         const admin = {
             id: createId(),
             username,
@@ -308,8 +320,7 @@ function loadUsers() {
             createdAt: new Date().toISOString()
         };
         fs.writeFileSync(USERS_FILE, JSON.stringify([admin], null, 2), 'utf8');
-        console.warn(`Auth users file created. Initial admin: ${username}` +
-            (process.env.AUTH_ADMIN_PASSWORD ? '' : ' / admin'));
+        console.warn(`Auth users file created. Initial admin: ${username}`);
         return [admin];
     }
 
@@ -615,7 +626,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/auth/logout', (req, res) => {
     const sessionId = parseCookies(req.headers.cookie || '')[SESSION_COOKIE];
     if (sessionId) sessions.delete(sessionId);
-    res.setHeader('Set-Cookie', sessionCookieValue('', 0));
+    res.setHeader('Set-Cookie', clearSessionCookie());
     res.json({ ok: true });
 });
 
@@ -656,6 +667,42 @@ app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
     }
 
     res.status(201).json(sanitizeUser(user));
+});
+
+app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+        return res.status(400).json({ error: 'Не указан пользователь' });
+    }
+
+    const users = loadUsers();
+    const target = users.find(user => user.id === targetId);
+    if (!target) {
+        return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    if (target.id === req.user.id) {
+        return res.status(400).json({ error: 'Нельзя удалить свой аккаунт' });
+    }
+
+    const adminCount = users.filter(user => user.role === 'admin').length;
+    if (target.role === 'admin' && adminCount <= 1) {
+        return res.status(400).json({ error: 'Нельзя удалить последнего администратора' });
+    }
+
+    for (const [sessionId, session] of sessions.entries()) {
+        if (session.userId === target.id) {
+            sessions.delete(sessionId);
+        }
+    }
+
+    try {
+        saveUsers(users.filter(user => user.id !== target.id));
+    } catch (error) {
+        console.error('Error deleting user:', error.message);
+        return res.status(500).json({ error: 'Не удалось удалить пользователя' });
+    }
+
+    res.json({ ok: true });
 });
 
 app.use(['/api', '/hls'], requireAuth);

@@ -661,6 +661,31 @@ body.authenticated .auth-screen {
     font-weight: 800;
 }
 
+.user-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+}
+
+.user-delete {
+    color: #ff8a80;
+    border-color: rgba(255, 138, 128, 0.35);
+}
+
+.user-delete:hover {
+    color: #fff;
+    background: rgba(255, 82, 82, 0.18);
+    border-color: rgba(255, 82, 82, 0.45);
+}
+
+.user-self {
+    color: var(--muted);
+    font-size: var(--fs-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
 .btn {
     border: none;
     border-radius: 10px;

@@ -1,0 +1,9 @@
+[
+  {
+    "id": "ca0a5673-73bf-4560-ae69-ce062fd23346",
+    "username": "Khomovskiy",
+    "passwordHash": "scrypt:64a2c938e8e89ed9f383e164dc9ce611:a0be60c85f04124ad9f6950ae0c056828cd7e8ebf7487db3214691378a05f00f787c8a01b556b373f40f5697df0192a3df8ddee2ffd2a96ffcc9bfc3fa892843",
+    "role": "admin",
+    "createdAt": "2026-07-13T09:33:03.406Z"
+  }
+]

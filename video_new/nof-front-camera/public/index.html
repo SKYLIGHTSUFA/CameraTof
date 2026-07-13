@@ -123,8 +123,10 @@
         let refreshTimer = null;
         let currentUser = null;
         let appEventsBound = false;
+        let authBootstrap = false;
 
         const $ = (id) => document.getElementById(id);
+        const FETCH_OPTIONS = { credentials: 'same-origin' };
 
         // ---------- Аутентификация ----------
 
@@ -143,7 +145,12 @@
         }
 
         async function apiFetch(url, options = {}) {
-            const res = await fetch(url, options);
+            const fetchOnce = () => fetch(url, { ...FETCH_OPTIONS, ...options });
+            let res = await fetchOnce();
+            if (res.status === 401 && authBootstrap) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                res = await fetchOnce();
+            }
             if (res.status === 401) {
                 showLogin('Сессия истекла, войдите снова');
                 throw new Error('auth_required');
@@ -152,7 +159,7 @@
         }
 
         async function fetchCurrentUser() {
-            const res = await fetch('/api/auth/me');
+            const res = await fetch('/api/auth/me', FETCH_OPTIONS);
             if (!res.ok) return null;
             const data = await res.json().catch(() => ({}));
             return data.user || null;
@@ -170,7 +177,9 @@
             const password = $('loginPassword').value;
 
             try {
+                authBootstrap = true;
                 const res = await fetch('/api/auth/login', {
+                    ...FETCH_OPTIONS,
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password })
@@ -181,16 +190,25 @@
                     $('loginError').hidden = false;
                     return;
                 }
+
+                currentUser = data.user;
+                updateUserPanel();
+                document.body.classList.add('authenticated');
                 $('loginPassword').value = '';
+                $('loginUsername').value = '';
                 await startAuthenticatedApp(data.user);
             } catch (error) {
-                $('loginError').textContent = 'Ошибка сети при входе';
-                $('loginError').hidden = false;
+                if (error.message !== 'auth_required') {
+                    $('loginError').textContent = 'Ошибка сети при входе';
+                    $('loginError').hidden = false;
+                }
+            } finally {
+                authBootstrap = false;
             }
         }
 
         async function logout() {
-            await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+            await fetch('/api/auth/logout', { ...FETCH_OPTIONS, method: 'POST' }).catch(() => {});
             showLogin();
         }
 
@@ -797,10 +815,51 @@
                 role.className = 'user-role';
                 role.textContent = user.role === 'admin' ? 'admin' : 'user';
 
+                const actions = document.createElement('div');
+                actions.className = 'user-row-actions';
+
+                if (user.id !== currentUser.id) {
+                    const del = document.createElement('button');
+                    del.type = 'button';
+                    del.className = 'btn-small btn-small-ghost user-delete';
+                    del.textContent = 'Удалить';
+                    del.title = `Удалить ${user.username}`;
+                    del.addEventListener('click', () => deleteUser(user));
+                    actions.appendChild(del);
+                } else {
+                    const selfMark = document.createElement('span');
+                    selfMark.className = 'user-self';
+                    selfMark.textContent = 'вы';
+                    actions.appendChild(selfMark);
+                }
+
                 row.appendChild(name);
                 row.appendChild(role);
+                row.appendChild(actions);
                 list.appendChild(row);
             });
+        }
+
+        async function deleteUser(user) {
+            if (!currentUser || currentUser.role !== 'admin') return;
+            if (!confirm(`Удалить пользователя «${user.username}»?`)) return;
+
+            $('usersError').hidden = true;
+            try {
+                const res = await apiFetch(`/api/users/${encodeURIComponent(user.id)}`, {
+                    method: 'DELETE'
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    showUsersError(data.error || 'Не удалось удалить пользователя');
+                    return;
+                }
+                await loadUsers();
+            } catch (error) {
+                if (error.message !== 'auth_required') {
+                    showUsersError('Ошибка сети при удалении пользователя');
+                }
+            }
         }
 
         async function loadUsers() {
@@ -911,6 +970,7 @@
             currentUser = user;
             updateUserPanel();
             bindAppEvents();
+            document.body.classList.add('authenticated');
             if (refreshTimer) clearInterval(refreshTimer);
             destroyPlayers();
             lastSignature = '';
@@ -918,7 +978,6 @@
             configs = await fetchConfigs();
             allCameras = await fetchCameras();
             activeId = defaultActiveId();
-            document.body.classList.add('authenticated');
             renderTabs();
             render(true);
 
