@@ -394,6 +394,32 @@
                 }));
         }
 
+        function isRtspCamera(camera) {
+            const name = (camera.name || camera.id || '').replace(/^camera_/, '');
+            return /^\d+-\d+$/.test(name);
+        }
+
+        function balancedCameraRows(cameras) {
+            const rowCount = Math.min(cameras.length, cameras.length <= 4 ? 2 : 3);
+            const rows = [];
+            for (let i = 0; i < rowCount; i += 1) {
+                const start = Math.floor(i * cameras.length / rowCount);
+                const end = Math.floor((i + 1) * cameras.length / rowCount);
+                rows.push({
+                    lineKey: `rtsp-row-${i + 1}`,
+                    cameras: cameras.slice(start, end)
+                });
+            }
+            return rows;
+        }
+
+        function cameraRowsForLayout(cameras, playVideo) {
+            if (playVideo && cameras.length > 0 && cameras.every(isRtspCamera)) {
+                return balancedCameraRows(cameras);
+            }
+            return groupCamerasByLine(cameras);
+        }
+
         function floorDown(value, decimals = 0) {
             const factor = 10 ** decimals;
             return Math.floor(Number(value) * factor) / factor;
@@ -464,7 +490,7 @@
                 container.appendChild(hint);
             }
 
-            const lineGroups = groupCamerasByLine(cameras);
+            const lineGroups = cameraRowsForLayout(cameras, playVideo);
 
             lineGroups.forEach(({ lineKey, cameras: lineCams }) => {
                 const row = document.createElement('div');
