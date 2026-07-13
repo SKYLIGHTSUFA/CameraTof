@@ -6,7 +6,7 @@ services:
     container_name: gige-hls-front
     restart: unless-stopped
     ports:
-      - "4010:4010"
+      - "443:4010"
     volumes:
       # Исходники фронта монтируются с хоста, чтобы обновлять UI без rebuild образа.
       - ./server.js:/app/server.js:ro
